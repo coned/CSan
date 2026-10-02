@@ -1,0 +1,29 @@
+# Build directories
+build/
+build-*/
+cmake-build-*/
+out/
+
+# CMake generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+compile_commands.json
+Testing/
+_deps/
+
+# Build products
+*.o
+*.a
+*.so
+*.ll.out
+
+# Editor and tool caches
+.cache/
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
