@@ -1,0 +1,51 @@
+// SPDX-License-Identifier: MIT
+// Eight readers and a writer that does not join them.
+// Expected: race (write after read).
+#include "csan_runtime.h"
+#include "csan_test.h"
+
+#include <atomic>
+#include <cstdio>
+#include <thread>
+#include <vector>
+
+namespace {
+constexpr uint32_t kReaders = 8;
+}
+
+int main() {
+    csan_init(1, 0, 1u << 16);
+    char* x = static_cast<char*>(csan_alloc(8));
+    if (x == nullptr) {
+        std::fprintf(stderr, "alloc failed\n");
+        return 1;
+    }
+    x[0] = 1;
+
+    std::atomic<uint32_t> ready{0};
+    std::atomic<bool> go{false};
+    std::vector<std::thread> ts;
+    for (uint32_t i = 0; i < kReaders; ++i) {
+        ts.emplace_back([&] {
+            volatile char v = x[0]; // read x, with no edge to the writer below
+            (void)v;
+            ready.fetch_add(1, std::memory_order_relaxed);
+            while (!go.load(std::memory_order_relaxed)) {
+                std::this_thread::yield();
+            }
+        });
+    }
+    // All eight reads have happened, but no join yet, so nothing orders them
+    // before the write.
+    while (ready.load(std::memory_order_relaxed) < kReaders) {
+        std::this_thread::yield();
+    }
+
+    x[0] = 2; // write-after-read against all eight readers
+
+    go.store(true, std::memory_order_relaxed);
+    for (std::thread& t : ts) {
+        t.join();
+    }
+    return csan_expect_race(CSAN_RACE_WRITE_AFTER_READ).finish();
+}
