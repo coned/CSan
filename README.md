@@ -8,7 +8,7 @@ machine only if:
 
 - the writer wrote the line back (`clwb` or `clflushopt`) and fenced (`sfence` or `mfence`): it **published** the line;
 - the reader flushed the line (`clflushopt`) and fenced (`mfence`): it **acquired** the line;
-- the write happens-before the read (atomics, mutexes, fork and join).
+- the publish happens-before the acquire (through atomics, mutexes, fork and join).
 
 csan reports every access where this did not happen:
 
