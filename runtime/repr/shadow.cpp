@@ -10,14 +10,16 @@ namespace csan {
 
 // ---- ℝ_x ------------------------------------------------------------------
 //
-// The list of threads that have read the byte since its last write, each with
-// its latest read's clock (see ByteCell in layout.h):
+// The reads of the byte since its last write, in FastTrack's adaptive form
+// (see ByteCell in layout.h):
 //
-//   one reader      ℝ_x = [t ↦ c, all others 0], which the epoch
-//                   epoch_make(t,c) describes EXACTLY, so `rd` holds it and
-//                   ℝ_x ⊑ ℂ_t is one covers() -- no indirection, no scan.
-//   more readers    the kRdSharedBit is set and `rd` is the offset of a
-//                   ReadList (readclock.h), scanned in the number of readers.
+//   epoch           while the reads are totally ordered by happens-before, the
+//                   last read follows all the others, so its epoch c@t alone
+//                   decides ℝ_x ⊑ ℂ_u for every later writer u: `rd` holds it
+//                   and the check is one covers() -- no indirection, no scan.
+//   more readers    after two concurrent reads, the kRdSharedBit is set and
+//                   `rd` is the offset of a ReadList (readclock.h) with the
+//                   latest read of each thread, scanned in the number of readers.
 //
 // Losing a reader record to an exhausted arena can only miss a
 // write-after-read, never invent one.
@@ -30,20 +32,22 @@ bool rd_le(const ByteCell* c, uint32_t tid) {
     return readlist_le(c->rd, tid);
 }
 
-// ℝ_x[t] ← ℂ_t[t]
+// ℝ_x ← addRead(ℝ_x, t), FastTrack's three read cases:
+//   epoch ⊑ ℂ_t    the recorded read happens before this one: replace it by
+//                  this read's epoch (always so for the same thread);
+//   epoch ⋢ ℂ_t    a concurrent read: move both into a ReadList;
+//   ReadList       raise this thread's entry.
 void rd_set(ByteCell* c, uint32_t tid) {
     uint32_t now = vc_get(tid, tid);
     if (cell_rd_shared(c)) {
         readlist_raise(c->rd, tid, now);
         return;
     }
-    if (c->rd == kEpochBot || epoch_tid(c->rd) == tid) {
-        if (c->rd == kEpochBot || epoch_clock(c->rd) < now) {
-            c->rd = epoch_make(tid, now); // still one reader: still exact
-        }
+    if (thread_vc(tid).covers(c->rd)) {
+        c->rd = epoch_make(tid, now);
         return;
     }
-    // A second distinct reader: the first reader's epoch moves into a list.
+    // A concurrent read: the recorded epoch moves into a list.
     uint32_t off = readlist_new(c->rd);
     if (off == 0) {
         return;
