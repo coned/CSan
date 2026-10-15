@@ -15,8 +15,9 @@ namespace csan {
 
 // R_x, whichever form the cell holds it in.
 //
-// rd_le is R_x <= C_tid; rd_set is R_x[tid] <- C_tid[tid], promoting the cell
-// from a single packed epoch to a full clock on the second distinct reader;
+// rd_le is R_x <= C_tid; rd_set is R_x <- addRead(R_x, tid), which keeps a single
+// packed epoch while the reads are ordered and promotes the cell to a full
+// clock on the first concurrent read;
 // rd_reset is R_x <- 0, freeing that clock if one was allocated.
 bool rd_le(const ByteCell* c, uint32_t tid);
 void rd_set(ByteCell* c, uint32_t tid);

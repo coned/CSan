@@ -151,9 +151,10 @@ struct SlotProv {
 // the clock of its latest read. It is only upserted, scanned and reset, never
 // indexed by thread, so it is stored two ways:
 //
-//   rd-shared clear  at most one reader, held as the packed Epoch c@t itself.
+//   rd-shared clear  the reads are ordered by happens-before, so the last one
+//                    summarizes them: held as its packed Epoch c@t itself.
 //                    kEpochBot = no reader.
-//   rd-shared set    two or more readers: `rd` is the arena offset of a
+//   rd-shared set    two concurrent reads: `rd` is the arena offset of a
 //                    ReadList holding one Epoch per reader.
 //
 // SPLIT is a representation detail. An access covering part of a word makes
@@ -208,7 +209,7 @@ static inline void cell_set_acq_off(ByteCell* c, uint32_t off) {
     c->acq = (c->acq & ~kOffMask) | (off & kOffMask);
 }
 
-// ---- ReadList: R_x with two or more readers -------------------------------
+// ---- ReadList: R_x after two concurrent reads ------------------------------
 //
 // 32 bytes, chained. One Epoch per thread that has read the byte since its
 // last write, kEpochBot in unused entries; a full block links to another.
@@ -406,7 +407,7 @@ enum ArenaClass {
     kClassSplit = 1,   // 8 x sizeof(ByteCell)
     kClassVC = 2,      // threads x 4        (an S_x clock)
     kClassFullMap = 3, // promoted SlotMap: threads states + threads clocks
-    kClassReadList = 4, // sizeof(ReadList): R_x with two or more readers
+    kClassReadList = 4, // sizeof(ReadList): R_x after two concurrent reads
     kNumArenaClasses = 5,
 };
 
