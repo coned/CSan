@@ -38,6 +38,11 @@ target_include_directories(csan_runtime
                            PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/runtime)
 target_link_libraries(csan_runtime PUBLIC Threads::Threads)
+# 64-bit epochs (16-bit tid, 48-bit clock) for runs whose clocks pass 24 bits.
+option(CSAN_EPOCH64 "Use 64-bit epochs" OFF)
+if(CSAN_EPOCH64)
+  target_compile_definitions(csan_runtime PUBLIC CSAN_EPOCH64)
+endif()
 # PIC so the runtime can also be linked into a shared object (a dlopen()ed
 # plugin); otherwise its TLS is emitted local-exec and that link fails.
 set_target_properties(csan_runtime PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -143,13 +148,13 @@ endfunction()
 
 # Both atomic stores: the reporting one and the line's last write.
 csan_trace_test(trace_names_atomic_writers m2_t2_atomic_line_conflict_no_chain
-  "WRITE of size 1 at [^\n]*machine M1.*no_chain\\.cpp:21:.*LAST WRITE of that line by [^\n]*machine M0.*no_chain\\.cpp:34:.*PUBLISHED line: none.*ACQUIRED line: none")
+  "WRITE of size 1 at [^\n]*machine M1.*no_chain\\.cpp:21:.*LAST WRITE of byte \\+0x00 of that line by [^\n]*machine M0.*no_chain\\.cpp:34:.*PUBLISHED byte \\+0x00 of that line: none.*ACQUIRED byte \\+0x00 of that line: none")
 # The publication's clwb and sfence, and the earlier flush that acquired nothing.
 csan_trace_test(trace_flush_acquired_nothing m2_t2_atomic_line_conflict_flush_too_early
-  "PUBLISHED line by thread T0[^\n]*machine M0\\):\n *write back at:\n[^\n]*too_early\\.cpp:49:.*fenced at:\n[^\n]*too_early\\.cpp:50:.*ACQUIRED line: none.*ACQUIRED NOTHING[^\n]*\n[^\n]*too_early\\.cpp:22:")
+  "PUBLISHED byte \\+0x00 of that line by thread T0[^\n]*machine M0\\):\n *write back at:\n[^\n]*too_early\\.cpp:49:.*fenced at:\n[^\n]*too_early\\.cpp:50:.*ACQUIRED byte \\+0x00 of that line: none.*ACQUIRED NOTHING[^\n]*\n[^\n]*too_early\\.cpp:22:")
 # One sfence finishing two publications, each with its own clwb.
 csan_trace_test(trace_one_fence_two_slots m2_t2_trace_chain_one_fence_two_lines
   "write back at:\n[^\n]*two_lines\\.cpp:35:.*fenced at:\n[^\n]*two_lines\\.cpp:37:.*write back at:\n[^\n]*two_lines\\.cpp:36:.*fenced at:\n[^\n]*two_lines\\.cpp:37:")
 # Five unfenced flushes, read out of a promoted map.
 csan_trace_test(trace_promoted_map m2_t2_trace_chain_promoted_acq
-  "FLUSHED, NOT FENCED line by thread T[0-9]+[^\n]*not counted: no fence has finished it:\n *flush at:\n[^\n]*promoted_acq\\.cpp:22:.*FLUSHED, NOT FENCED line by thread T[0-9]+[^\n]*not counted: no fence has finished it:\n *flush at:\n[^\n]*promoted_acq\\.cpp:22:.*FLUSHED, NOT FENCED line by thread T[0-9]+[^\n]*not counted: no fence has finished it:\n *flush at:\n[^\n]*promoted_acq\\.cpp:22:.*FLUSHED, NOT FENCED line by thread T[0-9]+[^\n]*not counted: no fence has finished it:\n *flush at:\n[^\n]*promoted_acq\\.cpp:22:.*FLUSHED, NOT FENCED line by thread T[0-9]+[^\n]*not counted: no fence has finished it:\n *flush at:\n[^\n]*promoted_acq\\.cpp:22:")
+  "FLUSHED, NOT FENCED byte \\+0x00 of that line by thread T[0-9]+[^\n]*not counted: no fence has finished it:\n *flush at:\n[^\n]*promoted_acq\\.cpp:22:.*FLUSHED, NOT FENCED byte \\+0x00 of that line by thread T[0-9]+[^\n]*not counted: no fence has finished it:\n *flush at:\n[^\n]*promoted_acq\\.cpp:22:.*FLUSHED, NOT FENCED byte \\+0x00 of that line by thread T[0-9]+[^\n]*not counted: no fence has finished it:\n *flush at:\n[^\n]*promoted_acq\\.cpp:22:.*FLUSHED, NOT FENCED byte \\+0x00 of that line by thread T[0-9]+[^\n]*not counted: no fence has finished it:\n *flush at:\n[^\n]*promoted_acq\\.cpp:22:.*FLUSHED, NOT FENCED byte \\+0x00 of that line by thread T[0-9]+[^\n]*not counted: no fence has finished it:\n *flush at:\n[^\n]*promoted_acq\\.cpp:22:")

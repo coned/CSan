@@ -9,6 +9,7 @@
 #include "repr/vectorclock.h"
 #include "repr/slotmap.h"
 #include "repr/shadow.h"
+#include "rules/rules.h"
 
 #include <cinttypes>
 #include <cstdlib>
@@ -26,11 +27,8 @@ namespace csan {
 
 namespace {
 
-// ---- modules ---------------------------------------------------------------
-//
-// A frame is (module index, file offset), not a runtime address: each machine
-// has its own load bias and stacks are symbolized after the fact. dladdr gives
-// both but walks the link map, so its answers are cached per process.
+// ---- modules ----
+// dladdr walks the link map, so its answers are cached per process.
 
 struct ModuleRange {
     uintptr_t lo;
@@ -39,14 +37,12 @@ struct ModuleRange {
     uint32_t index;
 };
 
-// Process-local: the shared table is the authority on names and indices, this
-// is only a cache of where those modules landed in THIS process.
+// Process-local cache; the shared table owns names and indices.
 constexpr uint32_t kModuleCacheSize = 8;
 ModuleRange t_module_cache[kModuleCacheSize];
 uint32_t t_module_cached = 0;
 
-// The shared index for this path, adding it if it is new. Caller holds the
-// global lock.
+// Shared index for this path, added if new. Caller holds the global lock.
 uint32_t module_index_locked(const char* path) {
     for (uint32_t i = 0; i < g_header->module_count; ++i) {
         if (std::strcmp(g_header->modules[i].path, path) == 0) {
@@ -67,8 +63,7 @@ bool elf_is_exec(const void* map) {
     return std::memcmp(eh->e_ident, ELFMAG, SELFMAG) == 0 && eh->e_type == ET_EXEC;
 }
 
-// A return address as (module, file offset -- or virtual address, above), or 0
-// when it cannot be placed.
+// A return address as a packed frame, or 0 when it cannot be placed.
 uint64_t pack_frame(const void* pc) {
     uintptr_t a = reinterpret_cast<uintptr_t>(pc);
     for (uint32_t i = 0; i < t_module_cached; ++i) {
@@ -82,17 +77,14 @@ uint64_t pack_frame(const void* pc) {
         return 0;
     }
     uintptr_t base = reinterpret_cast<uintptr_t>(info.dli_fbase);
-    // llvm-symbolizer wants a file offset for a shared object but a VIRTUAL
-    // ADDRESS for a non-PIE executable, which is mapped at its own link
-    // address; subtracting the base there yields an address it rejects.
+    // llvm-symbolizer wants a file offset for a shared object but a virtual
+    // address for a non-PIE executable.
     uintptr_t bias = elf_is_exec(info.dli_fbase) ? 0 : base;
     spin_lock(&g_header->global_lock);
     uint32_t idx = module_index_locked(info.dli_fname);
     spin_unlock(&g_header->global_lock);
     if (t_module_cached < kModuleCacheSize) {
-        // One page past the last seen address is a guess at the module's
-        // extent; a miss only costs another dladdr, never a wrong answer,
-        // because the next lookup re-checks and widens.
+        // A guessed extent; a miss only costs another dladdr.
         t_module_cache[t_module_cached] = {base, a + 4096, bias, idx};
         ++t_module_cached;
     }
@@ -107,8 +99,7 @@ uint32_t mix(uint64_t v, uint32_t h) {
     return h;
 }
 
-// The id of this stack, interning it if new. 0 when the table is full, which
-// prints as unavailable rather than as some other stack.
+// Intern a stack; 0 when the table is full.
 uint32_t intern_stack(const uint64_t* frames) {
     uint32_t h = 1;
     for (uint32_t i = 0; i < kStackFrames; ++i) {
@@ -145,20 +136,15 @@ uint32_t intern_stack(const uint64_t* frames) {
     return 0;
 }
 
-// ---- capturing a stack ------------------------------------------------------
-//
-// The frame chain, walked by hand. __builtin_return_address(N) for N > 0 is
-// undefined past the current function and faults on a stack shorter than N.
-//
-// Every candidate is checked before it is followed -- inside the stack, above
-// the previous frame, aligned -- so a short stack comes back short.
+// ---- capturing a stack ----
+// Walked by hand: __builtin_return_address(N > 0) faults on a short stack.
+// Each frame pointer is checked (in the stack, increasing, aligned) first.
 struct Frame {
     Frame* next;
     void* ret;
 };
 
-// No thread stack is larger, so a chain reaching past this is not a chain.
-constexpr uintptr_t kMaxFrameSpan = 8u << 20;
+constexpr uintptr_t kMaxFrameSpan = 8u << 20; // no thread stack is larger
 
 __attribute__((noinline)) uint32_t capture_frames(const void** out, uint32_t max, uint32_t skip) {
     Frame* fp = static_cast<Frame*>(__builtin_frame_address(0));
@@ -180,14 +166,9 @@ __attribute__((noinline)) uint32_t capture_frames(const void** out, uint32_t max
     return n > skip ? n - skip : 0;
 }
 
-// ---- symbolization ----------------------------------------------------------
-//
-// Frames go to llvm-symbolizer as "<module> 0x<offset>" lines. Without one, the
-// module and offset print as they are.
+// ---- symbolization (llvm-symbolizer; raw module+offset without it) ----
 
-// The symbolizer matching the compiler that built this runtime. Derived rather
-// than hardcoded: only that version can read the debug info that compiler
-// emits.
+// Matches the runtime's compiler version: only it reads that compiler's DWARF.
 #define CSAN_STR2(x) #x
 #define CSAN_STR(x) CSAN_STR2(x)
 #if defined(__clang_major__)
@@ -196,10 +177,8 @@ constexpr const char* kVersionedSymbolizer = "llvm-symbolizer-" CSAN_STR(__clang
 constexpr const char* kVersionedSymbolizer = "llvm-symbolizer";
 #endif
 
-// One child per stack: all its frames are written, stdin is CLOSED, then the
-// answers are read to EOF. Closing is what avoids a deadlock -- the child's
-// stdout is a pipe and so fully buffered, and a query-at-a-time reader would
-// wait for a flush that only comes when the buffer fills.
+// One child per stack: write all frames, close stdin, read to EOF. The child's
+// piped stdout is fully buffered, so query-at-a-time would deadlock.
 bool symbolize_stack(const char* const* modules, const uint64_t* offs, uint32_t n,
                      char funcs[kStackFrames][256], char locs[kStackFrames][512]) {
     for (uint32_t i = 0; i < n; ++i) {
@@ -237,8 +216,7 @@ bool symbolize_stack(const char* const* modules, const uint64_t* offs, uint32_t 
         if (env != nullptr && *env != '\0') {
             execlp(env, env, nullptr);
         }
-        // The version-matched name first: an older symbolizer silently answers
-        // "??:0:0" for DWARF it cannot read.
+        // Version-matched first: an older one answers "??:0:0" silently.
         execlp(kVersionedSymbolizer, kVersionedSymbolizer, nullptr);
         execlp("llvm-symbolizer", "llvm-symbolizer", nullptr);
         _exit(127);
@@ -330,9 +308,9 @@ uint32_t trace_cur_pos() {
     return t_cur_pos;
 }
 
-uint32_t trace_record(uint8_t kind, uintptr_t addr, uint32_t len, uint32_t tid, uint32_t from,
-                      uint32_t src) {
-    if (!tracing() || tid >= kMaxThreads) {
+uint32_t trace_record_event(uint8_t kind, uintptr_t addr, uint32_t len, uint32_t tid,
+                            uint32_t from, uint32_t src) {
+    if (tid >= kMaxThreads) {
         return 0;
     }
     // Drop capture_frames' own frame and this one, so #0 is the hook's caller.
@@ -343,9 +321,8 @@ uint32_t trace_record(uint8_t kind, uintptr_t addr, uint32_t len, uint32_t tid, 
         frames[i] = pack_frame(pcs[i]);
     }
 
-    // The kernel tid, so a report can name the thread the way top and gdb do.
-    // Keyed by the checker tid rather than a flag: a forked child inherits the
-    // parent's thread-locals, and would skip this having never recorded its own.
+    // Kernel tid for reports. Keyed by checker tid, not a thread-local flag,
+    // which a forked child would inherit.
     static thread_local uint32_t noted_for = UINT32_MAX;
     if (noted_for != tid) {
         noted_for = tid;
@@ -361,7 +338,7 @@ uint32_t trace_record(uint8_t kind, uintptr_t addr, uint32_t len, uint32_t tid, 
     e.kind = kind;
     e.len = static_cast<uint8_t>(len > 255 ? 255 : len);
     e.src = static_cast<uint16_t>(src);
-    // Last, and released: a walker that sees this seq can read the rest.
+    // Released last: a reader that sees this seq sees the rest.
     atomic_store_u32_rel(&e.seq, seq);
     return event_ref(tid, seq);
 }
@@ -388,8 +365,7 @@ const Event* trace_event_at(uint32_t ref) {
         return nullptr;
     }
     const Event* e = &g_events[static_cast<uint64_t>(tid) * g_trace_depth + (seq % g_trace_depth)];
-    // The slot is reused every trace_depth events, so a seq that no longer
-    // matches means this event has aged out.
+    // A mismatched seq means the slot was reused.
     return atomic_load_u32_acq(&e->seq) == seq ? e : nullptr;
 }
 
@@ -436,8 +412,7 @@ const Event* trace_find_after(uint32_t tid, uint32_t after_seq, uint8_t kind, ui
     return nullptr;
 }
 
-// The text of one source line, or empty when the file is not readable. Cached,
-// since a report prints the same lines repeatedly.
+// One source line, or empty if unreadable. Cached.
 const std::string& source_line(const std::string& path, uint32_t line) {
     static std::unordered_map<std::string, std::string> cache;
     static const std::string empty;
@@ -459,16 +434,13 @@ const std::string& source_line(const std::string& path, uint32_t line) {
         }
         std::fclose(f);
     }
-    // Trim leading indentation and the trailing newline.
     size_t b = text.find_first_not_of(" \t");
     size_t e = text.find_last_not_of(" \t\r\n");
     text = (b == std::string::npos) ? std::string() : text.substr(b, e - b + 1);
     return cache.emplace(std::move(key), std::move(text)).first->second;
 }
 
-// A frame nobody wants to read: the standard library's own plumbing between the
-// program's call and where it lands. TSan drops these too. Frame 0 is always
-// kept, whatever it is.
+// Standard-library plumbing, dropped as TSan does. Frame 0 is always kept.
 bool boring_frame(const char* func, const char* loc) {
     if (std::strcmp(func, "??") == 0) {
         return true; // no debug info for it, so it names nothing
@@ -489,7 +461,6 @@ bool boring_frame(const char* func, const char* loc) {
     return false;
 }
 
-// Split "path:line:col" into its path and line.
 void split_loc(const char* loc, std::string* path, uint32_t* line) {
     path->clear();
     *line = 0;
@@ -513,8 +484,7 @@ void trace_print_stack(std::FILE* out, uint32_t stack_id) {
         std::fprintf(out, "    #0 <no stack captured>\n");
         return;
     }
-    // Formatted once per distinct (interned) stack, so the symbolizer runs once
-    // per place a finding comes from, not once per finding.
+    // Cached per interned stack: the symbolizer runs once per stack.
     static std::unordered_map<uint32_t, std::string> cache;
     auto hit = cache.find(stack_id);
     if (hit != cache.end()) {
@@ -536,10 +506,7 @@ void trace_print_stack(std::FILE* out, uint32_t stack_id) {
         std::fprintf(out, "    #0 <no stack captured>\n");
         return;
     }
-    // Every frame holds a RETURN address, which points just past the call. Ask
-    // the symbolizer about the byte before it so the answer is the call site
-    // and not the next statement -- otherwise a frame reads as `}` or as the
-    // line after the one that did the work.
+    // A return address points past the call; ask about the byte before it.
     uint64_t query[kStackFrames] = {};
     for (uint32_t i = 0; i < n; ++i) {
         query[i] = offs[i] > 0 ? offs[i] - 1 : 0;
@@ -553,16 +520,13 @@ void trace_print_stack(std::FILE* out, uint32_t stack_id) {
         if (i > 0 && named && boring_frame(funcs[i], locs[i])) {
             continue;
         }
-        // "#N func file:line (module+0xoffset)", as TSan prints it. The module
-        // and offset stay on the line even when the name resolved: they are what
-        // makes a frame checkable by hand afterwards.
+        // "#N func file:line (module+0xoffset)"; module+offset always kept.
         char line[1024];
         if (named && funcs[i][0] != '\0') {
             std::snprintf(line, sizeof(line), "    #%u %s %s (%s+0x%" PRIx64 ")\n", shown,
                           funcs[i], locs[i], mods[i], offs[i]);
             text += line;
             ++shown;
-            // The source line itself, under the frame that names it.
             std::string path;
             uint32_t num = 0;
             split_loc(locs[i], &path, &num);
@@ -585,8 +549,7 @@ void trace_print_stack(std::FILE* out, uint32_t stack_id) {
 
 namespace {
 
-// Where the address is, named so a reader can act on it: the region a program
-// registered, or the checker's own pool.
+// Name the address's region: a registered one, or the pool.
 void print_location(std::FILE* out, uintptr_t addr) {
     uintptr_t pool = reinterpret_cast<uintptr_t>(g_pool);
     if (g_pool != nullptr && addr >= pool && addr < pool + g_header->cxl_size) {
@@ -594,9 +557,8 @@ void print_location(std::FILE* out, uintptr_t addr) {
         return;
     }
     for (uint32_t i = 0; i < g_header->watch_count; ++i) {
-        uintptr_t base = g_watch_base[i];
-        if (g_header->watch[i].in_use && base != 0 && addr >= base &&
-            addr < base + g_header->watch[i].size) {
+        uintptr_t base = g_regions[1 + i].lo;
+        if (g_header->watch[i].in_use && addr >= base && addr < g_regions[1 + i].hi) {
             std::fprintf(out, "region %u+0x%06" PRIx64, g_header->watch[i].id,
                          static_cast<uint64_t>(addr - base));
             return;
@@ -605,9 +567,7 @@ void print_location(std::FILE* out, uintptr_t addr) {
     std::fprintf(out, "0x%012" PRIxPTR, addr);
 }
 
-// One TSan-style block: a headline, then the stack. A null event means the
-// ring no longer holds it, which is said rather than silently skipped -- an
-// absent block and an aged-out one mean opposite things.
+// Headline then stack. A null (aged-out) event is said, not skipped.
 void print_block(std::FILE* out, const char* headline, const Event* e) {
     std::fprintf(out, "  %s\n", headline);
     if (e == nullptr) {
@@ -618,8 +578,7 @@ void print_block(std::FILE* out, const char* headline, const Event* e) {
     std::fprintf(out, "\n");
 }
 
-// A block for a Pos from the state: its headline, then the stack. 0 means the
-// state was set where tracing recorded no position.
+// Headline then stack for a Pos; 0 = no position recorded.
 void print_pos_block(std::FILE* out, const char* headline, uint32_t pos) {
     std::fprintf(out, "  %s\n", headline);
     if (pos == 0) {
@@ -630,65 +589,54 @@ void print_pos_block(std::FILE* out, const char* headline, uint32_t pos) {
     std::fprintf(out, "\n");
 }
 
-// Every non-empty slot of the map at `off`, for the report of thread `tid`:
-// who, whether it is finished, whether the rule could count it -- its epoch in
-// tid's clock, and for an acquisition on tid's machine -- and the positions
-// that recorded and finished it. Returns how many slots counted.
+// Print each entry of the map at `off`, and whether it is a witness of `q`
+// for `tid` (query_entry). Returns how many were.
 uint32_t print_slots(std::FILE* out, const char* unit, const char* what, const char* rec_verb,
-                     uint32_t off, uint32_t tid, bool same_machine) {
-    SlotMap* m = slotmap_at(off);
+                     uint32_t off, uint32_t tid, Query q) {
     uint32_t shown = 0, counted = 0;
     VectorClock c = thread_vc(tid);
-    auto one = [&](uint32_t u, SlotState st, Epoch e, uint32_t rec, uint32_t fin) {
-        bool final = st == kSlotFinal;
-        bool here = !same_machine || machine_of(u) == machine_of(tid);
-        bool known = c.covers(e);
-        bool counts = final && here && known;
+    bool same_machine = q != kQueryPubB && q != kQueryPubPrev;
+    slotmap_for_each<true>(off, [&](uint32_t u, SlotState st, Epoch E, Epoch E_r, uint32_t rec,
+                                    uint32_t fin) {
+        bool counts = query_entry(q, u, st, E, E_r, c, tid);
+        bool finished = st == kSlotFinish || st == kSlotAllowAccess;
+        // Set by a store (store_update), which records one Pos for both.
+        bool by_store = same_machine && finished && rec != 0 && rec == fin;
         counted += counts ? 1 : 0;
+        if (by_store && machine_of(u) != machine_of(tid)) {
+            return false; // another machine's bookkeeping; never a witness here
+        }
         ++shown;
-        const char* verb = final ? what : (same_machine ? "FLUSHED, NOT FENCED" : "WRITTEN BACK, NOT FENCED");
+        // Why an entry is not a witness, in the order query_entry tests it.
+        const char* verb = finished ? what : (same_machine ? "FLUSHED, NOT FENCED" : "WRITTEN BACK, NOT FENCED");
         const char* why = counts ? ""
-                          : !final ? " -- not counted: no fence has finished it"
-                          : !here  ? " -- not counted: another machine"
-                                   : " -- not counted: not in this thread's clock";
+                          : !finished ? " -- not counted: no fence has finished it"
+                          : q == kQueryAcqR && st != kSlotAllowAccess
+                              ? " -- not counted: only an sfence finished it; a read needs an mfence"
+                          : same_machine && machine_of(u) != machine_of(tid)
+                              ? " -- not counted: another machine"
+                              : " -- not counted: not in this thread's clock";
         std::fprintf(out, "  %s %s by thread T%u (tid=%u, machine M%u)%s:\n", verb, unit, u,
                      g_header->os_tid[u], machine_of(u), why);
+        if (by_store) {
+            print_pos_block(out, "  by its store at:", rec);
+            return false;
+        }
         char sub[64];
         std::snprintf(sub, sizeof(sub), "  %s at:", rec_verb);
         print_pos_block(out, sub, rec);
-        if (final) {
+        if (finished) {
             print_pos_block(out, "  fenced at:", fin);
         }
-    };
-    if (m != nullptr && m->full_off == 0) {
-        SlotProv* prov = slotmap_prov(m);
-        for (uint32_t i = 0; i < 4; ++i) {
-            SlotState st = slot_state(m, i);
-            if (st != kSlotBot) {
-                one(epoch_tid(m->inline_e[i]), st, m->inline_e[i],
-                    prov != nullptr ? prov->rec[i] : 0, prov != nullptr ? prov->fin[i] : 0);
-            }
-        }
-    } else if (m != nullptr) {
-        uint8_t* st = fullmap_states(m->full_off);
-        uint32_t* clk = fullmap_clocks(m->full_off);
-        uint32_t* rec = fullmap_rec_pos(m->full_off);
-        uint32_t* fin = fullmap_fin_pos(m->full_off);
-        for (uint32_t u = 0; u < g_threads; ++u) {
-            if (st[u] != kSlotBot) {
-                one(u, static_cast<SlotState>(st[u]), epoch_make(u, clk[u]),
-                    rec != nullptr ? rec[u] : 0, fin != nullptr ? fin[u] : 0);
-            }
-        }
-    }
+        return false;
+    });
     if (shown == 0) {
         std::fprintf(out, "  %s %s: none.\n\n", what, unit);
     }
     return counted;
 }
 
-// The thread's newest event: the access being reported, recorded just before
-// the rule that found the conflict ran.
+// The thread's newest event is the reported access.
 const Event* newest_of(uint32_t tid) {
     return tid < kMaxThreads ? trace_event_at(event_ref(tid, g_header->trace_seq[tid])) : nullptr;
 }
@@ -696,7 +644,7 @@ const Event* newest_of(uint32_t tid) {
 } // namespace
 
 void trace_print_finding(std::FILE* out, uint32_t race_kind, uintptr_t addr, uint32_t len,
-                         uint32_t tid, uint32_t other_tid) {
+                         uint32_t tid, uint32_t other_tid, uintptr_t byte) {
     if (!tracing()) {
         return;
     }
@@ -714,45 +662,58 @@ void trace_print_finding(std::FILE* out, uint32_t race_kind, uintptr_t addr, uin
     trace_print_stack(out, self != nullptr ? self->stack : 0);
     std::fprintf(out, "\n");
 
-    // Write-backs and flushes act on whole lines, so they are matched by line.
+    // Write-backs and flushes are matched by line.
     uintptr_t line = addr & ~static_cast<uintptr_t>(kLineBytes - 1);
     uint32_t line_len = static_cast<uint32_t>(kLineBytes);
-    // A line kind conflicts with a write anywhere on the line, not at this byte,
-    // and is cleared by a line acquisition rather than a byte one.
+    // Line kinds are decided by another byte of the line, which this store
+    // left in place; a write needs only an sfence to have finished its flush.
     bool line_kind = race_kind == CSAN_RACE_WRITE_WITHOUT_LINE_ACQUIRE ||
-                     race_kind == CSAN_RACE_ATOMIC_WRITE_WITHOUT_LINE_ACQUIRE ||
-                     race_kind == CSAN_RACE_WRITE_BEFORE_HB_LINE_WRITE;
+                     race_kind == CSAN_RACE_ATOMIC_WRITE_WITHOUT_LINE_ACQUIRE;
 
     (void)other_tid;
-    // The chain is read from the state the rule just decided on, not searched
-    // for in the history: the last write it compared against, and every
-    // publication and acquisition slot, each with the code that made it.
-    LineCell* lc = line_cell_at(addr);
-    ByteCell* x = nullptr;
-    if (!line_kind) {
-        ByteCell* wc = word_cell_at(addr);
-        x = cell_split(wc) ? &split_array(wc)[addr & (kWordBytes - 1)] : wc;
+    // The chain comes from the state the rule decided on, not the history.
+    ByteCell* wc = word_cell_at(byte);
+    ByteCell* x = cell_split(wc) ? &split_array(wc)[byte & (kWordBytes - 1)] : wc;
+    char unit[48];
+    if (line_kind) {
+        std::snprintf(unit, sizeof(unit), "byte +0x%02x of that line",
+                      static_cast<unsigned>(byte & (kLineBytes - 1)));
+    } else {
+        std::snprintf(unit, sizeof(unit), "byte");
     }
-    const char* unit = line_kind ? "line" : "byte";
-    Epoch w = line_kind ? lc->wl : x->wb;
-    uint32_t* wpos = line_kind ? line_pos_at(addr) : write_pos_at(addr);
+    Epoch w = x->wb;
+    uint32_t* wpos = write_pos_at(byte);
     if (w == kEpochBot) {
         std::fprintf(out, "  LAST WRITE of that %s: none.\n\n", unit);
     } else {
         uint32_t wt = epoch_tid(w);
-        char head[160];
-        std::snprintf(head, sizeof(head), "LAST WRITE of that %s by thread T%u (tid=%u, machine M%u):",
-                      unit, wt, g_header->os_tid[wt], machine_of(wt));
+        char head[192];
+        std::snprintf(head, sizeof(head), "LAST WRITE of %s by thread T%u (tid=%u, machine M%u):",
+                      line_kind ? unit : "that byte", wt, g_header->os_tid[wt], machine_of(wt));
         print_pos_block(out, head, wpos != nullptr ? *wpos : 0);
     }
-    uint32_t pub_off = line_kind ? lc->pub : cell_pub_off(x);
-    uint32_t acq_off = line_kind ? lc->acq : cell_acq_off(x);
-    print_slots(out, unit, "PUBLISHED", "write back", pub_off, tid, /*same_machine=*/false);
-    uint32_t acquired = print_slots(out, unit, "ACQUIRED", "flush", acq_off, tid,
-                                    /*same_machine=*/true);
+    // Last write from this machine: CanAcq consults only P'_x, the publications
+    // of W'_x, the previous write from another machine.
+    bool own_last = line_kind && w != kEpochBot && machine_of(epoch_tid(w)) == machine_of(tid);
+    if (!own_last) {
+        print_slots(out, unit, "PUBLISHED", "write back", cell_pub_off(x), tid, kQueryPubB);
+    } else {
+        if (x->wprev == kEpochBot) {
+            std::fprintf(out, "  PREVIOUS WRITE of %s from another machine: none.\n\n", unit);
+        } else {
+            uint32_t pt = epoch_tid(x->wprev);
+            std::fprintf(out,
+                         "  PREVIOUS WRITE of %s from another machine by thread T%u (tid=%u, "
+                         "machine M%u).\n\n",
+                         unit, pt, g_header->os_tid[pt], machine_of(pt));
+            print_slots(out, unit, "PUBLISHED previous write", "write back", x->pprev, tid,
+                        kQueryPubPrev);
+        }
+    }
+    uint32_t acquired = print_slots(out, unit, "ACQUIRED", "flush", cell_acq_off(x), tid,
+                                    line_kind ? kQueryAcqW : kQueryAcqR);
 
-    // A flush that acquired nothing leaves no slot, so the state cannot show
-    // it; its event carries the rule's verdict, which is said here.
+    // A flush that acquired nothing leaves no slot; report its event's verdict.
     if (acquired == 0) {
         for (uint32_t u = 0; u < kMaxThreads; ++u) {
             if (machine_of(u) != machine_of(tid)) {
@@ -762,8 +723,7 @@ void trace_print_finding(std::FILE* out, uint32_t race_kind, uintptr_t addr, uin
             if (e == nullptr) {
                 continue;
             }
-            uint32_t got = line_kind ? flush_verdict_lines(e->from) : flush_verdict_bytes(e->from);
-            if (got != 0) {
+            if (e->from != 0) {
                 continue; // it acquired, and a later write has since cleared that
             }
             char head[160];

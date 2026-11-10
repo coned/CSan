@@ -1,34 +1,42 @@
 // SPDX-License-Identifier: MIT
-// The per-byte shadow state: the read clock held inside a ByteCell, and the
-// split that gives a word's eight bytes cells of their own.
+// Per-byte shadow storage: the read record in a ByteCell, and word splitting.
+// No rule decisions here; those are in rules/.
 #ifndef CSAN_SHADOW_H
 #define CSAN_SHADOW_H
 
 #include "repr/arena.h"
-#include "state/layout.h"
+#include "repr/readclock.h"
 #include "repr/slotmap.h"
 #include "repr/vectorclock.h"
+#include "state/layout.h"
 
 #include <cstdint>
 
 namespace csan {
 
-// R_x, whichever form the cell holds it in.
-//
-// rd_le is R_x <= C_tid; rd_set is R_x <- addRead(R_x, tid), which keeps a single
-// packed epoch while the reads are ordered and promotes the cell to a full
-// clock on the first concurrent read;
-// rd_reset is R_x <- 0, freeing that clock if one was allocated.
-bool rd_le(const ByteCell* c, uint32_t tid);
-void rd_set(ByteCell* c, uint32_t tid);
-void rd_reset(ByteCell* c);
+// R_x storage only; the rules over it (R_x ⊑ C_t, addRead) are in
+// rules/rules_access.cpp. `rd` holds one Epoch, or, with kRdSharedBit set,
+// the offset of a ReadList (readclock.h).
+
+// Empty the record, freeing a ReadList if there is one.
+inline void rd_clear(ByteCell* c) {
+    if (cell_rd_shared(c)) {
+        readlist_free(cell_rd_off(c));
+        c->pub &= ~kRdSharedBit;
+    }
+    c->rd = kEpochBot;
+}
+
+// Turn the one-Epoch record into a ReadList holding that Epoch and
+// epoch_make(tid, now). Left as it was if the arena is exhausted, which can
+// only miss a race.
+void rd_to_list(ByteCell* c, uint32_t tid, uint32_t now);
 
 // The eight per-byte cells of a split word.
 ByteCell* split_array(const ByteCell* wc);
 
-// Where the last-write Pos lives for the byte at `addr`: the word's slot while
-// the word is unsplit, the byte's own after the split array. Null when
-// tracing is off.
+// Last-write Pos for the byte at `addr`: the word's while unsplit, else the
+// byte's own. Null when tracing is off.
 inline uint32_t* write_pos_at(uintptr_t addr) {
     if (!g_prov) {
         return nullptr;
@@ -40,18 +48,19 @@ inline uint32_t* write_pos_at(uintptr_t addr) {
     return reinterpret_cast<uint32_t*>(split_array(wc) + kWordBytes) + (addr & (kWordBytes - 1));
 }
 
-// The line's last-write Pos for the line holding `addr`; null when tracing is off.
-inline uint32_t* line_pos_at(uintptr_t addr) {
-    return g_prov ? &g_line_pos[line_cell_at(addr) - g_lines] : nullptr;
+// Record `pos` as the last write's Pos for the byte at `addr` (no-op when off).
+inline void set_write_pos(uintptr_t addr, uint32_t pos) {
+    if (uint32_t* p = write_pos_at(addr)) {
+        *p = pos;
+    }
 }
 
-// The cell of every byte of a line -- the word cell where eight bytes still
-// share one, each byte's own cell where the word is split -- as f(cell, addr).
-// Caller holds the line's lock.
+// f(cell, addr) for each cell of a line (word cell, or byte cells if split).
+// Caller holds the line lock.
 template <class F>
-inline void for_each_byte_cell(uintptr_t line, F f) {
+inline void for_each_byte_cell(const Shadow& s, uintptr_t line, F f) {
     for (uintptr_t word = line; word < line + kLineBytes; word += kWordBytes) {
-        ByteCell* wc = word_cell_at(word);
+        ByteCell* wc = s.cell(word);
         if (!cell_split(wc)) {
             f(wc, word);
             continue;
@@ -66,15 +75,31 @@ inline void for_each_byte_cell(uintptr_t line, F f) {
 // Free everything a cell points into and leave it empty.
 void cell_reset_state(ByteCell* c);
 
-// Give each byte of this word its own cell, every one inheriting the word's
-// current state, and return the array. Null if the arena cannot supply the
-// blocks, in which case the caller falls back to word granularity -- less
-// precise, but not unsound.
+// Give each byte its own cell, inheriting the word's state. Null if the arena
+// is exhausted; the caller stays at word granularity (less precise, not
+// unsound).
 ByteCell* ensure_split(ByteCell* wc);
 
-// Collapse a split word back to one cell. Called when a write covers the whole
-// word, which makes its eight bytes agree again by definition.
+// Collapse a split word, dropping its bytes' state.
 void unsplit(ByteCell* wc);
+
+// After a store to the whole of a split word: collapse it, keeping the state,
+// if its eight bytes hold the same state. True if it did.
+bool collapse_if_uniform(ByteCell* wc);
+
+// Before S_x is set at `key`: set kSyncBit so a plain write there ends the
+// sequence. Takes the line lock, so the caller must hold no sync stripe.
+void mark_release_site(uint64_t key);
+
+// Plain write to [lo, hi) in `wc`'s word: S_x <- 0 at each flagged byte.
+// Caller holds the line lock.
+void end_flagged_sequences(ByteCell* wc, uint64_t lo, uint64_t hi);
+
+inline void end_release_sequences(ByteCell* wc, uint64_t lo, uint64_t hi) {
+    if (cell_split(wc) || (wc->pub & kSyncBit) != 0) {
+        end_flagged_sequences(wc, lo, hi);
+    }
+}
 
 } // namespace csan
 

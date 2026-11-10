@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Machine 1 overwrites a whole line whose write-back was never fenced.
-// Expected: race (write-without-line-acquire).
+// Expected: race (write-without-publish: machine 0's dirty line can still
+// overwrite it), and no write-without-line-acquire: no byte is left on the line.
 #include "csan_runtime.h"
 #include "csan_test.h"
 
@@ -37,5 +38,7 @@ int main() {
         std::fprintf(stderr, "machine 1 role failed\n");
         return 1;
     }
-    return csan_expect_race(CSAN_RACE_WRITE_WITHOUT_LINE_ACQUIRE).finish();
+    return csan_expect_race(CSAN_RACE_WRITE_WITHOUT_PUBLISH)
+        .no_kind(CSAN_RACE_WRITE_WITHOUT_LINE_ACQUIRE)
+        .finish();
 }

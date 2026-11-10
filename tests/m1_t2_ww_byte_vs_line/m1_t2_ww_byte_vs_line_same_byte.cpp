@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Two threads of one machine write the same byte, unordered.
-// Expected: race (data-race), not write-before-hb-line-write.
+// Expected: race (data-race-ww) only.
 #include "csan_runtime.h"
 #include "csan_test.h"
 
@@ -23,7 +23,7 @@ int main() {
     });
     writer1.join();
     writer2.join();
-    return csan_expect_race(CSAN_RACE_DATA_RACE)
-        .no_kind(CSAN_RACE_WRITE_BEFORE_HB_LINE_WRITE)
+    return csan_expect_race(CSAN_RACE_DATA_RACE_WW)
+        .no_kind(CSAN_RACE_RETIRED_2)
         .finish();
 }

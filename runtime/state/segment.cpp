@@ -2,6 +2,7 @@
 // Creating, attaching to and configuring the shared segment, and the
 // per-process init that binds a machine.
 #include "state/segment.h"
+#include "repr/sync.h"
 
 #include "repr/arena.h"
 #include "base/atomics.h"
@@ -82,8 +83,7 @@ int open_segment_fd(const char* name) {
     return -1;
 }
 
-// All processes sharing a segment must compute the same layout, so every
-// tunable is read once from the environment and otherwise fixed.
+// Read once from the environment: every process must compute the same layout.
 uint32_t configured_clock_entries() {
     const char* env = getenv("CSAN_CLOCK_ENTRIES");
     if (env != nullptr && *env != '\0') {
@@ -114,9 +114,7 @@ uint64_t configured_arena(uint64_t cxl_size) {
             return v;
         }
     }
-    // Half the pool. The live set is bounded by the state accumulated since
-    // each location's last write (Install frees it), so this is generous; if
-    // it is ever not, arena_full says so loudly.
+    // Half the pool: generous, since Install frees state; arena_full reports otherwise.
     uint64_t want = cxl_size / 2;
     if (want < (4ull << 20)) {
         want = 4ull << 20;
@@ -124,10 +122,8 @@ uint64_t configured_arena(uint64_t cxl_size) {
     return want;
 }
 
-// CSAN_WATCH_BYTES: shadow reserved for regions the checker watches but did not
-// allocate (csan_watch). Zero by default -- a run that watches nothing pays
-// nothing -- and part of the layout, so every process must agree on it exactly
-// as they must agree on the pool size.
+// CSAN_WATCH_BYTES: shadow for csan_watch regions; default 0. Part of the
+// layout, so every process must agree on it.
 uint64_t configured_watch(void) {
     const char* env = getenv("CSAN_WATCH_BYTES");
     if (env != nullptr && *env != '\0') {
@@ -139,8 +135,7 @@ uint64_t configured_watch(void) {
     return 0;
 }
 
-// CSAN_TRACE: record every event with its call stack, so a finding can be
-// reported the way ThreadSanitizer reports one. Off by default.
+// CSAN_TRACE: record events with call stacks for TSan-style reports. Off by default.
 uint32_t configured_trace_depth(void) {
     const char* on = getenv("CSAN_TRACE");
     if (on == nullptr || *on == '0' || *on == '\0') {
@@ -204,8 +199,7 @@ void attach_shared_segment(uint32_t hosts, uint64_t cxl_size) {
     }
     if (static_cast<uint64_t>(st.st_size) != lay.total) {
         if (st.st_size != 0) {
-            // A stale file with the wrong size (all processes compute the same
-            // deterministic layout from the same environment): reclaim it.
+            // Stale file of the wrong size: reclaim it.
             close(fd);
             shm_unlink(shm_name().c_str());
             fd = open_segment_fd(shm_name().c_str());
@@ -241,31 +235,28 @@ void attach_shared_segment(uint32_t hosts, uint64_t cxl_size) {
     g_lines = reinterpret_cast<LineCell*>(g_segment + lay.lines_off);
     g_prov = lay.trace_depth != 0;
     g_cell_pos = g_prov ? reinterpret_cast<uint32_t*>(g_segment + lay.cellpos_off) : nullptr;
-    g_line_pos = g_prov ? reinterpret_cast<uint32_t*>(g_segment + lay.linepos_off) : nullptr;
     g_vc = reinterpret_cast<uint32_t*>(g_segment + lay.vc_off);
     g_frel = g_vc + static_cast<uint64_t>(lay.threads) * lay.threads;
     g_facq = g_frel + static_cast<uint64_t>(lay.threads) * lay.threads;
     g_frel_set = reinterpret_cast<uint8_t*>(g_facq +
                                             static_cast<uint64_t>(lay.threads) * lay.threads);
-    g_lock_clocks = g_segment + lay.clocks_off;
-    g_sync = reinterpret_cast<SyncEntry*>(
-        g_lock_clocks + static_cast<uint64_t>(lay.clock_entries) * lay.clock_stride);
-    g_sync_index = reinterpret_cast<uint32_t*>(g_sync + lay.clock_entries);
-    g_sync_index_mask = sync_index_slots(lay.clock_entries) - 1;
+    g_sync_stripes = reinterpret_cast<SyncStripe*>(g_segment + lay.sync_off);
+    g_sync = reinterpret_cast<SyncEntry*>(g_sync_stripes + kSyncStripes);
+    g_sync_slots = lay.sync_slots;
     g_arena = g_segment + lay.arena_off;
     g_pool = g_segment + lay.pool_off;
+    uintptr_t pool = reinterpret_cast<uintptr_t>(g_pool);
+    g_regions[0] = Region{pool, pool + cxl_size, 0 - static_cast<uint64_t>(pool)};
+    if (g_region_count == 0) {
+        __atomic_store_n(&g_region_count, 1u, __ATOMIC_RELEASE);
+    }
     g_threads = lay.threads;
-    g_clock_stride = lay.clock_stride;
 
     uint32_t state = atomic_load_u32(&g_header->init_state);
     if (state != kInitStateReady) {
         if (atomic_cas_u32(&g_header->init_state, kInitStateUninit, kInitStateInitializing)) {
             g_initializer = true;
-            // Everything but init_state: clearing it would let an attacher win the CAS too.
-            uint64_t flag = offsetof(SharedHeader, init_state);
-            std::memset(g_segment, 0, flag);
-            std::memset(g_segment + flag + sizeof(uint32_t), 0,
-                        lay.total - flag - sizeof(uint32_t));
+            // A new segment is zero, every cell's empty state: nothing to clear.
             g_header->magic = kMagic;
             g_header->version = kVersion;
             g_header->segment_size = lay.total;
@@ -281,18 +272,8 @@ void attach_shared_segment(uint32_t hosts, uint64_t cxl_size) {
             g_header->clock_entries = lay.clock_entries;
             g_header->arena_size = lay.arena_size;
             g_header->arena_bump = 8; // offset 0 is the null offset
-            // Epochs use kEpochBot as the empty sentinel, but the segment was
-            // just zeroed; stamp every cell explicitly.
-            for (uint64_t i = 0; i < lay.words; ++i) {
-                g_cells[i].wb = kEpochBot;
-                g_cells[i].rd = kEpochBot;
-            }
-            for (uint64_t i = 0; i < lay.lines; ++i) {
-                g_lines[i].wl = kEpochBot;
-            }
             atomic_store_u32_rel(&g_header->init_state, kInitStateReady);
         } else {
-            // Unbounded: clearing and stamping a large shadow takes as long as it takes.
             while (atomic_load_u32_acq(&g_header->init_state) != kInitStateReady) {
                 sched_yield();
             }
@@ -355,8 +336,13 @@ void csan_ensure_init(uint32_t hosts, uint32_t machine, uint64_t cxl_size) {
             cxl_size = kLineBytes;
         }
 
+        const char* once_env = getenv("CSAN_REPORT_ONCE");
+        g_report_once = once_env == nullptr || strcmp(once_env, "0") != 0;
+
         const char* limit_env = getenv("CSAN_REPORT_LIMIT");
-        if (limit_env != nullptr && *limit_env != '\0') {
+        if (limit_env != nullptr && strcmp(limit_env, "off") == 0) {
+            g_report_off = true;
+        } else if (limit_env != nullptr && *limit_env != '\0') {
             g_report_limit = strtoull(limit_env, nullptr, 0);
         }
 
@@ -394,16 +380,15 @@ void csan_ensure_init(uint32_t hosts, uint32_t machine, uint64_t cxl_size) {
         std::atexit([]() {
             std::fprintf(stderr,
                          "CSAN STATS: reads=%" PRIu64 " writes=%" PRIu64 " races=%" PRIu64
-                         " overflow=%" PRIu64 " lock_clocks=%u/%u sync_entries=%u/%u"
+                         " overflow=%" PRIu64 " sync_entries=%u/%u"
                          " clock_table_full=%" PRIu64 " arena=%" PRIu64 "/%" PRIu64
                          " arena_full=%" PRIu64 " promote=%" PRIu64 " split=%" PRIu64
                          " rd_shared=%" PRIu64 " epoch_overflow=%" PRIu64 " threads=%u\n",
-                         atomic_load_u64(&g_header->read_events),
-                         atomic_load_u64(&g_header->write_events),
-                         atomic_load_u64(&g_header->race_events),
+                         count_total(&ThreadCounts::reads),
+                         count_total(&ThreadCounts::writes),
+                         count_total(&ThreadCounts::races),
                          atomic_load_u64(&g_header->overflow_count),
-                         atomic_load_u32(&g_header->lock_count), g_header->clock_entries,
-                         atomic_load_u32(&g_header->release_count), g_header->clock_entries,
+                         sync_live(), g_header->clock_entries,
                          atomic_load_u64(&g_header->clock_table_full),
                          atomic_load_u64(&g_header->arena_bump),
                          atomic_load_u64(&g_header->arena_size),

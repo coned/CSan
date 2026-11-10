@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Two machines write different bytes of one line, unordered.
-// Expected: race (write-before-hb-line-write), no data-race.
+// Expected: race (write-without-line-acquire: the second writer's write-back
+// carries a stale copy of the first's byte), no data-race-ww.
 #include "csan_runtime.h"
 #include "csan_test.h"
 
@@ -28,7 +29,7 @@ int main() {
         std::fprintf(stderr, "machine 1 role failed\n");
         return 1;
     }
-    return csan_expect_race(CSAN_RACE_WRITE_BEFORE_HB_LINE_WRITE)
-        .no_kind(CSAN_RACE_DATA_RACE)
+    return csan_expect_race(CSAN_RACE_WRITE_WITHOUT_LINE_ACQUIRE)
+        .no_kind(CSAN_RACE_DATA_RACE_WW)
         .finish();
 }

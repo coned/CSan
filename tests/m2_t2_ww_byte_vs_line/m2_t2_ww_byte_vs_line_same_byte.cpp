@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Two machines write the same byte, unordered.
-// Expected: race (data-race); the line kind is left to the byte.
+// Expected: race (data-race-ww); the line kind is left to the byte.
 #include "csan_runtime.h"
 #include "csan_test.h"
 
@@ -28,7 +28,7 @@ int main() {
         std::fprintf(stderr, "machine 1 role failed\n");
         return 1;
     }
-    return csan_expect_race(CSAN_RACE_DATA_RACE)
-        .no_kind(CSAN_RACE_WRITE_BEFORE_HB_LINE_WRITE)
+    return csan_expect_race(CSAN_RACE_DATA_RACE_WW)
+        .no_kind(CSAN_RACE_RETIRED_2)
         .finish();
 }

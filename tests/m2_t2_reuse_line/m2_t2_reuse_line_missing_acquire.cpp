@@ -73,6 +73,6 @@ int main() {
     pthread_mutex_unlock(&s->m);
 
     return csan_expect_race(CSAN_RACE_WRITE_WITHOUT_LINE_ACQUIRE)
-        .no_kind(CSAN_RACE_WRITE_BEFORE_HB_LINE_WRITE)
+        .no_kind(CSAN_RACE_RETIRED_2)
         .finish();
 }

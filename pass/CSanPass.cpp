@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // LLVM pass: inserts csan runtime hooks around memory accesses, cache
 // maintenance, fences, atomics, locks and thread joins.
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
@@ -26,8 +27,7 @@
 
 using namespace llvm;
 
-// Supports LLVM 15 through 23 (opaque pointers). LLVM 16 renamed
-// StringRef::startswith to starts_with.
+// LLVM 15-23. LLVM 16 renamed StringRef::startswith to starts_with.
 #if LLVM_VERSION_MAJOR < 16
 static inline bool startsWith(StringRef name, StringRef prefix) {
     return name.startswith(prefix);
@@ -38,10 +38,8 @@ static inline bool startsWith(StringRef name, StringRef prefix) {
 }
 #endif
 
-// Environment the pass reads at COMPILE time (a build system does not track it):
-//
-//   CSAN_SCOPE=sub,str    instrument only functions whose name contains one of
-//                         these. Empty (the default) instruments everything.
+// CSAN_SCOPE=sub,str (read at compile time, untracked by the build): instrument
+// only functions whose name contains one of these. Empty means all.
 
 namespace {
 
@@ -71,8 +69,7 @@ Value* toI64(Value* V, Instruction& I, Type* I64Ty) {
     return builder.CreateZExtOrTrunc(V, I64Ty);
 }
 
-// Which construct produced a write-back or flush, for reporting. Shared with
-// the runtime (CSAN_SRC_* in csan_runtime.h), mirrored rather than included.
+// Mirrors CSAN_SRC_* in csan_runtime.h.
 enum : uint32_t {
     CSAN_SRC_CLWB = 1,
     CSAN_SRC_CLFLUSHOPT = 2,
@@ -81,7 +78,7 @@ enum : uint32_t {
     CSAN_SRC_ASM = 0x100,
 };
 
-// Flag bits shared with the runtime (see AtomicFlags there).
+// Mirrors the runtime's AtomicFlags.
 enum : uint32_t {
     kAtomicAcquire = 1u << 0,
     kAtomicRelease = 1u << 1,
@@ -89,7 +86,12 @@ enum : uint32_t {
     kAtomicMFenced = 1u << 5,     // the lowering is a full machine barrier
 };
 
-// The value type an atomic instruction operates on.
+// The stack is never CXL memory, so plain accesses there need no hook.
+// Atomics are still replaced: they order threads.
+bool onStack(Value* ptr) {
+    return isa<AllocaInst>(getUnderlyingObject(ptr));
+}
+
 Type* atomicValueType(Instruction& I) {
     if (auto* LI = dyn_cast<LoadInst>(&I)) return LI->getType();
     if (auto* SI = dyn_cast<StoreInst>(&I)) return SI->getValueOperand()->getType();
@@ -98,8 +100,8 @@ Type* atomicValueType(Instruction& I) {
     return nullptr;
 }
 
-// Only integer/pointer atomics that fit in the runtime's uint64_t ABI are
-// replaced; floats, vectors and >8-byte types get plain read/write hooks.
+// Only integer/pointer atomics fitting the runtime's uint64_t ABI are
+// replaced; others get plain read/write hooks.
 bool canReplaceAtomic(Instruction& I, Module& M) {
     Type* ty = atomicValueType(I);
     if (ty == nullptr || (!ty->isIntegerTy() && !ty->isPointerTy())) return false;
@@ -133,16 +135,12 @@ uint32_t atomicFlagsFor(AtomicOrdering ord, bool isLoadSide) {
     return f;
 }
 
-// MFENCED: the lowering is `lock`-prefixed or `xchg`, a full barrier that the
-// SDM lists among the operations ordering CLWB and CLFLUSHOPT, so it does to
-// the relays what an mfence does.
-//
-// A property of the LOWERING, not the C++ order, so it cannot fold into
-// atomicFlagsFor: every RMW is locked at every ordering, a seq_cst store is
-// `xchg` or `mov; mfence`, everything else is a plain `mov`.
+// Whether the x86 lowering is a full barrier (lock prefix or xchg), which
+// orders clwb/clflushopt like mfence. Depends on the lowering, not the C++
+// order: every RMW/cmpxchg is locked; of stores, only seq_cst is.
 bool isMFenced(Instruction& I) {
     if (isa<AtomicRMWInst>(I) || isa<AtomicCmpXchgInst>(I)) {
-        return true; // lock xadd / lock xchg / lock cmpxchg, whatever the order
+        return true;
     }
     if (auto* SI = dyn_cast<StoreInst>(&I)) {
         return SI->getOrdering() == AtomicOrdering::SequentiallyConsistent;
@@ -205,23 +203,20 @@ void replaceAtomic(Instruction& I, Module& M, Type* i32Ty, Type* i64Ty,
         return;
     }
     auto* CX = cast<AtomicCmpXchgInst>(&I);
-    // Bits 0-1 describe the SUCCESS ordering; the failure ordering's acquire
-    // has its own bit, because a failing compare-exchange is a load at the
-    // failure ordering and must not inherit the success ordering's effects.
+    // Bits 0-1 are the success ordering. A failed cmpxchg is a load at the
+    // failure ordering, so its acquire gets its own bit.
     uint32_t flags = atomicFlagsFor(CX->getSuccessOrdering(), true) |
                      atomicFlagsFor(CX->getSuccessOrdering(), false);
     if ((atomicFlagsFor(CX->getFailureOrdering(), true) & kAtomicAcquire) != 0) {
         flags |= kAtomicFailAcquire;
     }
-    // Set whether or not the comparison will succeed: `lock cmpxchg` asserts the
-    // prefix and fences either way, unlike the release half, which needs a write.
+    // lock cmpxchg fences even when the compare fails.
     if (isMFenced(I)) flags |= kAtomicMFenced;
     Value* cmp = CX->getCompareOperand();
     Value* r = b.CreateCall(atomicCasFn, {CX->getPointerOperand(), toI64(cmp),
                                           toI64(CX->getNewValOperand()), size,
                                           ConstantInt::get(i32Ty, flags)});
-    // cmpxchg yields { oldValue, didSwap }; the runtime returns the value that
-    // was in memory, which equals the comparand exactly when the swap happened.
+    // Rebuild { old, success }: success iff old == comparand.
     Value* oldVal = fromI64(r);
     Value* ok = ty->isPointerTy() ? b.CreateICmpEQ(b.CreatePtrToInt(oldVal, i64Ty), toI64(cmp))
                                   : b.CreateICmpEQ(oldVal, cmp);
@@ -232,13 +227,8 @@ void replaceAtomic(Instruction& I, Module& M, Type* i32Ty, Type* i64Ty,
     I.eraseFromParent();
 }
 
-// The checker's own code, which must not be instrumented: the runtime's entry
-// points (__csan_*), its public API (csan_*), and the test harness helpers
-// (csan_test_*) that call them.
-//
-// Anchored, not `contains`: a substring test makes every symbol with "csan"
-// anywhere in it invisible to the pass, which quietly turns a program into a
-// clean bill of health rather than into a build error.
+// The checker's own functions, never instrumented. Prefix match, not substring:
+// a substring match would silently skip any user symbol containing "csan".
 bool isCheckerName(StringRef name) {
     return startsWith(name, "__csan_") || startsWith(name, "csan_");
 }
@@ -254,16 +244,13 @@ bool isUnlockCall(StringRef name) {
            name == "pthread_rwlock_unlock" || name == "_ZNSt5mutex6unlockEv";
 }
 
-// CLFLUSHOPT: a Flush event on its own. clang lowers _mm_clflushopt to a static
-// wrapper at -O3 (e.g. _ZL14_mm_clflushoptPKv), so match the wrapper too.
+// Also match the static _mm_clflushopt wrapper clang may leave at -O3.
 bool isFlushOptIntrinsic(StringRef name) {
     return name == "llvm.x86.clflushopt" || name.contains("_mm_clflushopt");
 }
 
-// CLFLUSH: Flush AND SFence. Unlike CLFLUSHOPT it is ordered with respect to
-// later stores on its own, so it completes line acquisition without a fence.
-// Both forms also write back a dirty line; that is part of the flush rule
-// (runtime/rules/rules_visibility.cpp), so no __csan_wb is emitted here.
+// CLFLUSH is Flush plus SFence: unlike CLFLUSHOPT it self-orders. The flush
+// rule covers the write-back, so no __csan_wb is emitted.
 bool isFlushIntrinsic(StringRef name) {
     if (isFlushOptIntrinsic(name)) {
         return false;
@@ -291,11 +278,7 @@ bool isMemSet(StringRef name) {
     return name == "llvm.memset.p0.i32" || name == "llvm.memset.p0.i64" || name == "memset";
 }
 
-// Cache maintenance written as inline asm rather than an intrinsic, e.g.
-// `asm volatile("clwb (%0)")` or `asm volatile("sfence")` in a program. Such a
-// call has no callee, so the name matching above never sees it; classify the
-// asm text instead. The same instruction is the same event whichever way it
-// was spelled.
+// Cache maintenance in inline asm has no callee to match; classify the text.
 enum class AsmKind { None, Flush, FlushOpt, Wb, Sfence, Mfence };
 
 AsmKind classifyInlineAsm(const CallBase* CB) {
@@ -304,16 +287,14 @@ AsmKind classifyInlineAsm(const CallBase* CB) {
         return AsmKind::None;
     }
     StringRef text = IA->getAsmString();
-    // ".byte 0x66; clflush" is how PMDK encodes CLFLUSHOPT where the assembler
-    // does not know the mnemonic, so the 0x66 prefix decides which this is.
+    // PMDK spells CLFLUSHOPT ".byte 0x66; clflush".
     if (text.contains("clflushopt") || (text.contains("clflush") && text.contains("0x66"))) {
         return AsmKind::FlushOpt;
     }
     if (text.contains("clflush")) {
         return AsmKind::Flush;
     }
-    // ".byte 0x66; xsaveopt" is how PMDK, and the code that copies it, encodes
-    // CLWB for assemblers that do not know the mnemonic.
+    // PMDK spells CLWB ".byte 0x66; xsaveopt".
     if (text.contains("clwb") || text.contains("xsaveopt")) {
         return AsmKind::Wb;
     }
@@ -326,8 +307,7 @@ AsmKind classifyInlineAsm(const CallBase* CB) {
     return AsmKind::None;
 }
 
-// The address a flush or write-back asm operates on: its first operand, which
-// an "r" or "m" constraint gives as a pointer or an integer.
+// The asm's first operand, as a pointer or an integer.
 Value* asmTargetAddress(CallBase* CB, Type* i8PtrTy) {
     if (CB->arg_size() == 0) {
         return nullptr;
@@ -342,7 +322,6 @@ Value* asmTargetAddress(CallBase* CB, Type* i8PtrTy) {
     return nullptr;
 }
 
-// Comma-separated list from an environment variable.
 std::vector<std::string> parseListEnv(const char* name) {
     std::vector<std::string> out;
     const char* env = std::getenv(name);
@@ -381,11 +360,8 @@ bool shouldInstrumentFunction(const Function& F, const std::vector<std::string>&
     if (isCheckerName(F.getName())) {
         return false;
     }
-    // An empty scope is the whole module. A program that narrows it must list
-    // every layer its happens-before flows through, not only the layer it
-    // suspects: std::atomic is emitted as libstdc++ __atomic_base helpers, so
-    // a scope that omits those sees the data and none of the synchronization
-    // ordering it, and every correctly released write becomes a report.
+    // A narrowed scope must include every layer synchronization flows through
+    // (e.g. libstdc++ __atomic_base helpers), or correct code is reported.
     return scope.empty() || nameContainsAny(F.getName(), scope);
 }
 
@@ -422,12 +398,9 @@ struct CSanPass : public PassInfoMixin<CSanPass> {
 
         std::vector<std::pair<Instruction*, std::function<void()>>> work;
 
-        // Thread create/join is hooked in every module, whatever CSAN_SCOPE
-        // says: threads are started outside the layer whose data is under test,
-        // and skipping them loses the fork/join edges.
+        // Joins are hooked regardless of CSAN_SCOPE, or join edges are lost.
 
-        // Insert a hook after a call or invoke. For an invoke, at the entry of
-        // the normal-destination block.
+        // For an invoke, "after" is the start of the normal destination.
         auto insertHookAfter = [&](CallBase* CB, FunctionCallee F, ArrayRef<Value*> args) {
             if (auto* II = dyn_cast<InvokeInst>(CB)) {
                 IRBuilder<> builder(&*II->getNormalDest()->getFirstInsertionPt());
@@ -451,10 +424,8 @@ struct CSanPass : public PassInfoMixin<CSanPass> {
                     insertHookAfter(CB, pthreadJoinFn, {pth});
                 });
             } else if (name == "_ZNSt6thread4joinEv") {
-                // std::thread::join: load the native handle from `this`
-                // (offset 0) BEFORE the call -- libstdc++ resets the handle
-                // to 0 once the thread is joined -- then merge the child's
-                // clock into the caller after the call returns.
+                // Read the handle (offset 0) before the call: libstdc++
+                // zeroes it on join.
                 Value* thisPtr = CB->getArgOperand(0);
                 work.emplace_back(CB, [&, CB, thisPtr]() {
                     Instruction* insPt = nullptr;
@@ -482,15 +453,10 @@ struct CSanPass : public PassInfoMixin<CSanPass> {
                         continue;
                     }
 
-                    // ---- atomics ------------------------------------------------
-                    // REPLACED by a runtime call that performs the access and
-                    // its happens-before effect in one critical section, as
-                    // ThreadSanitizer's __tsan_atomic_* do. Hooks placed around
-                    // the instruction would be separate operations, letting a
-                    // thread observe a released value before its clock.
-                    //
-                    // Only integer and pointer atomics up to 8 bytes; anything
-                    // else keeps the hook treatment.
+                    // ---- atomics ----
+                    // Replaced, not hooked: the access and its clock effect
+                    // must be atomic, or a thread could see a released value
+                    // before its clock.
                     {
                         Instruction* atomicI = nullptr;
                         if (auto* LI = dyn_cast<LoadInst>(&I)) {
@@ -511,6 +477,9 @@ struct CSanPass : public PassInfoMixin<CSanPass> {
 
                     if (auto* LI = dyn_cast<LoadInst>(&I)) {
                         Value* ptr = LI->getPointerOperand();
+                        if (onStack(ptr)) {
+                            continue;
+                        }
                         uint64_t bytes = M.getDataLayout().getTypeStoreSize(LI->getType());
                         Value* size = ConstantInt::get(i64Ty, bytes);
                         work.emplace_back(&I, [&, ptr, size]() {
@@ -521,13 +490,14 @@ struct CSanPass : public PassInfoMixin<CSanPass> {
 
                     if (auto* SI = dyn_cast<StoreInst>(&I)) {
                         Value* ptr = SI->getPointerOperand();
+                        if (onStack(ptr)) {
+                            continue;
+                        }
                         uint64_t bytes =
                             M.getDataLayout().getTypeStoreSize(SI->getValueOperand()->getType());
                         Value* size = ConstantInt::get(i64Ty, bytes);
-                        // A non-temporal store (_mm_stream_*, which clang emits
-                        // as a store with !nontemporal) reaches memory without
-                        // a clwb, so it is a Write followed by a WriteBack of
-                        // its line; an sfence still publishes it.
+                        // A !nontemporal store (_mm_stream_*) bypasses the
+                        // cache: Write then WriteBack; sfence still publishes.
                         bool nonTemporal =
                             SI->getMetadata(LLVMContext::MD_nontemporal) != nullptr;
                         work.emplace_back(&I, [&, ptr, size]() {
@@ -543,10 +513,8 @@ struct CSanPass : public PassInfoMixin<CSanPass> {
                         continue;
                     }
 
-                    // An LLVM `fence` is a C++ atomic_thread_fence: CLOCKS
-                    // ONLY. On x86 acquire, release and acquire-release fences
-                    // emit no instruction, so they order no clwb. A seq_cst
-                    // fence emits mfence and gets the visibility effect too.
+                    // Fences are clocks only (no x86 instruction), except
+                    // seq_cst, which emits mfence.
                     if (auto* FI = dyn_cast<FenceInst>(&I)) {
                         AtomicOrdering ord = FI->getOrdering();
                         if (ord == AtomicOrdering::Acquire) {
@@ -566,19 +534,14 @@ struct CSanPass : public PassInfoMixin<CSanPass> {
                         continue;
                     }
 
-                    // Lock and unlock calls may be `invoke`s: a lock function
-                    // that can throw, called where there is something to
-                    // unwind, is one. The lock hook must run AFTER the lock is
-                    // held and the unlock hook BEFORE it is released, so the
-                    // published clock is in place before the next holder can
-                    // merge it; for an invoke, "after" is the normal
-                    // destination.
+                    // Lock hook after the lock is held, unlock hook before
+                    // release, so the clock is published before the next
+                    // holder merges it. Locks may be invokes.
                     if (auto* CB = dyn_cast<CallBase>(&I)) {
                         if (Function* called = CB->getCalledFunction()) {
                             StringRef name = called->getName();
-                            // The lock's identity is its first argument; a
-                            // function that takes none guards one global
-                            // lock, and the function itself is its key.
+                            // Key: first argument, or the function itself
+                            // if it takes none.
                             auto lockKey = [&]() -> Value* {
                                 return CB->arg_size() > 0 ? CB->getArgOperand(0)
                                                           : static_cast<Value*>(called);
@@ -633,9 +596,11 @@ struct CSanPass : public PassInfoMixin<CSanPass> {
                         }
                         StringRef name = called->getName();
 
-                        // A memset is a write of its whole range.
                         if (isMemSet(name)) {
                             Value* dst = CI->getArgOperand(0);
+                            if (onStack(dst)) {
+                                continue;
+                            }
                             Value* n = toI64(CI->getArgOperand(2), I, i64Ty);
                             work.emplace_back(&I, [&, dst, n]() {
                                 insertCallBefore(&I, writeFn, {dst, n});
@@ -643,22 +608,16 @@ struct CSanPass : public PassInfoMixin<CSanPass> {
                             continue;
                         }
 
-                        // The _mm_* wrappers are matched by name for the case
-                        // where only the call is visible. When the wrapper's
-                        // body is in this module and instrumented, the
-                        // intrinsic inside it gets the hook, and hooking the
-                        // call too would record every flush twice.
+                        // An instrumented _mm_* body hooks its intrinsic;
+                        // hooking the call too would double-count.
                         if (!called->isDeclaration() && name.contains("_mm_") &&
                             shouldInstrumentFunction(*called, scope)) {
                             continue;
                         }
 
-                        // clflushopt and clwb act on the ONE line containing
-                        // their operand, which need not be line-aligned. The
-                        // hooks take a byte range and cover the lines it
-                        // touches, so the range is that single byte: 64 bytes
-                        // from a misaligned operand would spill onto the next
-                        // line and credit it with a write-back it never had.
+                        // Size 1: the instruction acts on the operand's one
+                        // line; 64 bytes from a misaligned operand would wrongly
+                        // cover the next line too.
                         if (isFlushOptIntrinsic(name) || isFlushIntrinsic(name)) {
                             Value* ptr = CI->getArgOperand(0);
                             Value* size = ConstantInt::get(i64Ty, 1);
@@ -691,10 +650,12 @@ struct CSanPass : public PassInfoMixin<CSanPass> {
                             work.emplace_back(&I, [&]() { insertCallBefore(&I, mfenceFn, {}); });
                         }
 
-                        // A memcpy is a plain read and a plain write.
                         if (isMemTransfer(name)) {
                             Value* dst = CI->getArgOperand(0);
                             Value* src = CI->getArgOperand(1);
+                            if (onStack(dst) && onStack(src)) {
+                                continue;
+                            }
                             Value* n = toI64(CI->getArgOperand(2), I, i64Ty);
                             work.emplace_back(&I, [&, dst, src, n]() {
                                 insertCallBefore(&I, memcpyFn, {dst, src, n});

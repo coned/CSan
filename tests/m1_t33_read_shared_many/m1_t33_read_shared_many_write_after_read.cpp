@@ -38,5 +38,5 @@ int main() {
     for (std::thread& t : ts) {
         t.join();
     }
-    return csan_expect_race(CSAN_RACE_WRITE_AFTER_READ).finish();
+    return csan_expect_race(CSAN_RACE_DATA_RACE_RW).finish();
 }

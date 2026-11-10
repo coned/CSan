@@ -16,20 +16,13 @@
 
 namespace csan {
 
-// 4 bytes.
-//
-//   off  size  field  contents
-//   ---  ----  -----  -------------------------------------------------------
-//     0     4  state  0 = free, else the pid of the process holding it
-//
-// No constructor and no POSIX object to initialize per process: a zeroed
-// segment is a segment full of free locks.
+// Zero-initialized = free, so a zeroed segment needs no per-process setup.
 struct SpinLock {
-    uint32_t state;
+    uint32_t state; // 0 = free, else the holder's pid
 };
 
-// This process's pid, cached: getpid() is a system call and the lock is hot.
-// Cleared in a forked child, which must not take the lock under its parent's pid.
+// Cached pid (the lock is hot). Cleared in a forked child, which must not lock
+// under its parent's pid.
 inline uint32_t g_lock_pid = 0;
 
 inline uint32_t lock_self_pid() {
@@ -44,8 +37,7 @@ inline uint32_t lock_self_pid() {
     return pid;
 }
 
-// Whether `pid` has exited. A zombie still answers kill(), so its state in
-// /proc is consulted too: a parent that has not reaped it yet is common.
+// Whether `pid` has exited. A zombie still answers kill(), so check /proc too.
 inline bool lock_owner_dead(uint32_t pid) {
     if (kill(static_cast<pid_t>(pid), 0) != 0) {
         return errno == ESRCH;
@@ -64,14 +56,8 @@ inline bool lock_owner_dead(uint32_t pid) {
     return paren != nullptr && (paren[1] == ' ') && (paren[2] == 'Z' || paren[2] == 'X');
 }
 
-// Process-shared spin lock: works on any MAP_SHARED memory (no constructor, no
-// POSIX object to initialize in every process). Critical sections are short,
-// so a pause/yield backoff is all that is needed.
-//
-// A process killed inside a critical section never unlocks. A waiter that has
-// yielded long enough checks whether the holder is still alive and, if it is
-// not, takes the lock over. What the dead process was in the middle of
-// updating is not repaired; the survivors go on with it as it was left.
+// Short critical sections, so pause/yield backoff suffices. A long waiter takes
+// over a lock whose holder died; the state it was updating is not repaired.
 inline void spin_lock_u32(uint32_t* state) {
     const uint32_t self = lock_self_pid();
     uint32_t spins = 0;

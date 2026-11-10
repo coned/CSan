@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Two unsynchronized writes to x.
-// Expected: race (data-race).
+// Expected: race (data-race-ww).
 #include "csan_runtime.h"
 #include "csan_test.h"
 
@@ -24,5 +24,5 @@ int main() {
     });
     writer1.join();
     writer2.join();
-    return csan_expect_race(CSAN_RACE_DATA_RACE).finish();
+    return csan_expect_race(CSAN_RACE_DATA_RACE_WW).finish();
 }

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
-// Epoch: a (thread, clock) pair in one 32-bit word.
+// Epoch: a (thread, clock) pair in one word: 32 bits by default, 64 with
+// CSAN_EPOCH64 (cmake -DCSAN_EPOCH64=ON) for runs whose clocks pass 24 bits.
 #ifndef CSAN_EPOCH_H
 #define CSAN_EPOCH_H
 
@@ -7,38 +8,38 @@
 
 namespace csan {
 
-constexpr uint32_t kTidBits = 8;
-constexpr uint32_t kClockBits = 32 - kTidBits; // 24
-constexpr uint32_t kClockMask = (1u << kClockBits) - 1;
-constexpr uint32_t kEpochBot = UINT32_MAX; // no write / no reader recorded
-
-//
-//   bit  31            24 23                             0
-//       +----------------+-------------------------------+
-//       |   tid (8)      |          clock (24)           |
-//       +----------------+-------------------------------+
-//
-//   tid    which thread the epoch belongs to. 8 bits covers kMaxThreads=256.
-//   clock  that thread's own clock component at the moment recorded (24 bits).
-//
-//   kEpochBot (all ones) is the empty value: no write, or no reader, recorded.
-//   It is not a valid packing -- tid 255 with clock 0xFFFFFF -- so it can never
-//   collide with a real epoch.
-//
-// Exceeding the clock field is reported, never wrapped: a wrapped clock makes
-// epoch_le() answer true for an unrelated epoch.
+#ifdef CSAN_EPOCH64
+typedef uint64_t Epoch;
+constexpr uint32_t kTidBits = 16;
+#else
 typedef uint32_t Epoch;
+constexpr uint32_t kTidBits = 8;
+#endif
+constexpr uint32_t kEpochBits = 8 * sizeof(Epoch);
+constexpr uint32_t kClockBits = kEpochBits - kTidBits; // 24, or 48
+constexpr Epoch kClockMask = (Epoch{1} << kClockBits) - 1;
+constexpr Epoch kEpochBot = 0; // no write / no reader recorded
+
+// The largest clock a thread may reach: the epoch's clock field, or the
+// vector clock's 32-bit entry if that is narrower.
+constexpr uint32_t kClockLimitBits = kClockBits < 32 ? kClockBits : 32;
+constexpr uint32_t kClockLimit =
+    kClockLimitBits < 32 ? static_cast<uint32_t>(kClockMask) : UINT32_MAX;
+
+// tid in the top kTidBits, clock below. Clocks start at 1, so zeroed shadow
+// is kEpochBot. Clock overflow is reported, never wrapped silently: a
+// wrapped clock would make epoch_le() true for an unrelated epoch.
 
 inline uint32_t epoch_tid(Epoch e) {
-    return e >> kClockBits;
+    return static_cast<uint32_t>(e >> kClockBits);
 }
 
 inline uint32_t epoch_clock(Epoch e) {
-    return e & kClockMask;
+    return static_cast<uint32_t>(e & kClockMask);
 }
 
 inline Epoch epoch_make(uint32_t tid, uint32_t clock) {
-    return (tid << kClockBits) | (clock & kClockMask);
+    return (static_cast<Epoch>(tid) << kClockBits) | (static_cast<Epoch>(clock) & kClockMask);
 }
 
 } // namespace csan

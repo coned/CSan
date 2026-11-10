@@ -1,16 +1,8 @@
 // SPDX-License-Identifier: MIT
-// The real atomic instructions, plus the flag word the pass uses to describe
-// one to the runtime.
-//
-// These perform the access itself; the rules layer wraps them so the access and
-// its clock effect happen inside one critical section. The pass replaces the
-// atomic instruction with that call, as ThreadSanitizer's __tsan_atomic_* do:
-// hooks placed around the instruction would be separate operations, letting a
-// consumer observe a released value before its clock was published.
-//
-// The access uses genuine atomic builtins, so uninstrumented code touching the
-// same location stays correct; only the pairing guarantee is limited to
-// instrumented accesses.
+// The real atomic accesses, and the flag word the pass passes to the runtime.
+// The pass replaces the instruction with a call (like __tsan_atomic_*) so the
+// access and its clock effect share one critical section; separate hooks would
+// let a consumer see a released value before its clock was published.
 #ifndef CSAN_RAWATOMIC_H
 #define CSAN_RAWATOMIC_H
 
@@ -27,15 +19,10 @@ enum AtomicRmwOp {
     kRmwXor = 5,
 };
 
-// Shared with the LLVM pass. Bits 0-1 are the operation's ordering (for
-// cmpxchg, its SUCCESS ordering); bit 4 the failure ordering's acquire, which
-// only cmpxchg uses. A failing compare-exchange performs no write, so there is
-// no failure-release bit.
-//
-// Bit 5, MFENCED, describes the x86 LOWERING rather than the C++ order -- a
-// relaxed fetch_add is still `lock xadd`. It means the lowering is a full
-// barrier, so the operation carries MFence's effect on the relays. Set by the
-// pass, which is where the lowering is known.
+// Shared with the LLVM pass. Bits 0-1: ordering (cmpxchg: success ordering).
+// Bit 4: cmpxchg failure acquire (a failed CAS writes nothing, so no release).
+// Bit 5: the x86 lowering is a full barrier (e.g. relaxed `lock xadd`), so the
+// op also has MFence's effect on the relays.
 enum AtomicFlags {
     kAtomicAcquire = 1u << 0,
     kAtomicRelease = 1u << 1,
@@ -107,8 +94,7 @@ inline uint64_t raw_atomic_rmw(void* p, uint64_t v, uint32_t size, uint32_t op) 
 }
 #undef CXL_RMW_FOR_TYPE
 
-// Returns the value that was in memory (equal to `expected` iff the swap
-// happened), matching LLVM cmpxchg's first result element.
+// Returns the old value (== expected iff swapped), like LLVM cmpxchg.
 inline uint64_t raw_atomic_cas(void* p, uint64_t expected, uint64_t desired, uint32_t size) {
     switch (size) {
     case 1: {

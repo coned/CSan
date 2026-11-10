@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Write and read of x with no synchronization.
-// Expected: race (read-before-hb-write).
+// Expected: race (data-race-wr).
 #include "csan_runtime.h"
 #include "csan_test.h"
 
@@ -25,5 +25,5 @@ int main() {
     });
     writer.join();
     reader.join();
-    return csan_expect_race(CSAN_RACE_READ_BEFORE_HB_WRITE).finish();
+    return csan_expect_race(CSAN_RACE_DATA_RACE_WR).finish();
 }

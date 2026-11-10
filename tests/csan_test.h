@@ -42,7 +42,7 @@ static inline void csan_test_arm_timeout() {
 //   .races(n) .reads(n) .writes(n) exact counts; .min_reads/.min_writes bounds
 //   .any_verdict()                skip the race/no-race check (schedule-dependent)
 // Counts are totals over every machine process (they live in the shared segment).
-//   return csan_expect_race(CSAN_RACE_WRITE_AFTER_READ).races(1).finish();
+//   return csan_expect_race(CSAN_RACE_DATA_RACE_RW).races(1).finish();
 class CsanExpect {
 public:
     explicit CsanExpect(bool expect_race) : expect_race_(expect_race) {}

@@ -1,241 +1,177 @@
 // SPDX-License-Identifier: MIT
 #include "repr/sync.h"
 
-#include "base/spinlock.h"
+#include "repr/arena.h"
 
 #include <cstdio>
+#include <vector>
 
 namespace csan {
 
-// ---- 𝕃_a, the lock clock table ----------------------------------------------
+namespace {
 
-ClockEntry* clock_entry(uint8_t* table, uint32_t i) {
-    return reinterpret_cast<ClockEntry*>(table + static_cast<uint64_t>(i) * g_clock_stride);
+uint64_t mix(uint64_t key) {
+    key ^= key >> 33;
+    key *= 0xff51afd7ed558ccdULL;
+    key ^= key >> 33;
+    return key;
 }
 
-VectorClock clock_entry_vc(ClockEntry* e) {
-    return VectorClock(
-        reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(e) + sizeof(ClockEntry)));
+SyncStripe* stripe_of(uint64_t key) {
+    return &g_sync_stripes[mix(key / kWordBytes) & (kSyncStripes - 1)];
 }
 
-ClockEntry* find_clock_entry(uint8_t* table, uint32_t count, uint64_t key) {
-    for (uint32_t i = 0; i < count; ++i) {
-        ClockEntry* e = clock_entry(table, i);
-        if (e->in_use && e->key == key) {
-            return e;
+SyncEntry* stripe_entries(const SyncStripe* s) {
+    return g_sync + static_cast<uint64_t>(s - g_sync_stripes) * g_sync_slots;
+}
+
+// `free_slot` gets the first reusable slot on the path. Bounded: sync_join
+// probes while a writer may be rearranging the stripe.
+SyncEntry* probe(SyncStripe* s, uint64_t key, SyncEntry** free_slot) {
+    SyncEntry* e = stripe_entries(s);
+    uint32_t mask = g_sync_slots - 1;
+    *free_slot = nullptr;
+    uint32_t i = static_cast<uint32_t>(mix(key) >> 32) & mask;
+    for (uint32_t n = 0; n < g_sync_slots; ++n, i = (i + 1) & mask) {
+        if (e[i].state == kSyncLive && e[i].key == key) {
+            return &e[i];
+        }
+        if (e[i].state != kSyncLive && *free_slot == nullptr) {
+            *free_slot = &e[i];
+        }
+        if (e[i].state == kSyncEmpty) {
+            return nullptr;
         }
     }
     return nullptr;
 }
 
-ClockEntry* find_or_add_clock_entry(uint8_t* table, uint32_t* count, uint64_t key) {
-    ClockEntry* e = find_clock_entry(table, *count, key);
-    if (e != nullptr) {
-        return e;
-    }
-    // Lock clocks are never retired (nothing knows when an address stops being
-    // a lock), so the table grows with the distinct lock addresses a run uses.
-    if (*count >= g_header->clock_entries) {
-        if (atomic_fetch_add_u64(&g_header->clock_table_full, 1) == 0) {
-            std::fprintf(stderr,
-                         "CSAN: lock clock table full (%u entries) -- "
-                         "happens-before can no longer be tracked for locks at new "
-                         "addresses, so FALSE REPORTS are expected from here on. "
-                         "Raise CSAN_CLOCK_ENTRIES.\n",
-                         g_header->clock_entries);
-            fflush(stderr);
+// Reinsert the live entries so dead slots stop lengthening probes.
+void rebuild(SyncStripe* s) {
+    SyncEntry* e = stripe_entries(s);
+    std::vector<SyncEntry> live;
+    for (uint32_t i = 0; i < g_sync_slots; ++i) {
+        if (e[i].state == kSyncLive) {
+            live.push_back(e[i]);
         }
-        return nullptr;
+        e[i].state = kSyncEmpty;
     }
-    e = clock_entry(table, (*count)++);
-    e->key = key;
-    e->in_use = 1;
-    clock_entry_vc(e).clear();
-    return e;
+    for (const SyncEntry& x : live) {
+        SyncEntry* slot;
+        probe(s, x.key, &slot);
+        *slot = x;
+    }
+    s->dead = 0;
 }
 
-// ---- 𝕊_x --------------------------------------------------------------------
-
-namespace {
-
-// Open-addressed hash index over the table. A slot holds entry index + 1, 0
-// for empty, kTomb for a deleted entry a probe must step over.
-constexpr uint32_t kTomb = UINT32_MAX;
-
-uint64_t slot_of(uint64_t key) {
-    key ^= key >> 33;
-    key *= 0xff51afd7ed558ccdULL;
-    key ^= key >> 33;
-    return key & g_sync_index_mask;
-}
-
-// The index slot naming `key`, or null.
-uint32_t* find_slot(uint64_t key) {
-    for (uint64_t i = slot_of(key);; i = (i + 1) & g_sync_index_mask) {
-        uint32_t v = g_sync_index[i];
-        if (v == 0) {
-            return nullptr;
-        }
-        if (v != kTomb && g_sync[v - 1].key == key) {
-            return &g_sync_index[i];
-        }
+void drop(SyncStripe* s, SyncEntry* e) {
+    if (e == nullptr) {
+        return;
     }
-}
-
-void index_insert(uint32_t entry) {
-    for (uint64_t i = slot_of(g_sync[entry].key);; i = (i + 1) & g_sync_index_mask) {
-        uint32_t v = g_sync_index[i];
-        if (v == 0 || v == kTomb) {
-            if (v == kTomb) {
-                --g_header->sync_tombstones;
-            }
-            g_sync_index[i] = entry + 1;
-            return;
-        }
-    }
-}
-
-// Tombstones only lengthen probes; past a quarter of the index, start over.
-void index_rebuild() {
-    for (uint64_t i = 0; i <= g_sync_index_mask; ++i) {
-        g_sync_index[i] = 0;
-    }
-    g_header->sync_tombstones = 0;
-    for (uint32_t i = 0; i < g_header->release_count; ++i) {
-        if (g_sync[i].in_use) {
-            index_insert(i);
-        }
-    }
-}
-
-SyncEntry* find(uint64_t key) {
-    uint32_t* slot = find_slot(key);
-    return slot != nullptr ? &g_sync[*slot - 1] : nullptr;
-}
-
-// The entry for `key`, taking a free slot when there is none. Null when the
-// table is full, which is a correctness cliff and so is loud.
-SyncEntry* find_or_add(uint64_t key) {
-    SyncEntry* e = find(key);
-    if (e != nullptr) {
-        return e;
-    }
-    uint32_t idx;
-    if (g_header->sync_free_head != 0) {
-        idx = g_header->sync_free_head - 1;
-        g_header->sync_free_head = static_cast<uint32_t>(g_sync[idx].key);
-    } else {
-        if (g_header->release_count >= g_header->clock_entries) {
-            if (atomic_fetch_add_u64(&g_header->clock_table_full, 1) == 0) {
-                std::fprintf(stderr,
-                             "CSAN: synchronization table full (%u entries) -- "
-                             "happens-before can no longer be tracked for new atomic "
-                             "addresses, so FALSE RACES are expected from here on. "
-                             "Raise CSAN_CLOCK_ENTRIES.\n",
-                             g_header->clock_entries);
-                fflush(stderr);
-            }
-            return nullptr;
-        }
-        idx = g_header->release_count++;
-    }
-    e = &g_sync[idx];
-    e->key = key;
-    e->in_use = 1;
-    e->s_off = 0;
-    index_insert(idx);
-    ++g_header->sync_live;
-    return e;
-}
-
-void release_entry(SyncEntry* e) {
-    if (e->s_off != 0) {
-        arena_free(kClassVC, e->s_off);
-        e->s_off = 0;
-    }
-    *find_slot(e->key) = kTomb;
-    ++g_header->sync_tombstones;
-    --g_header->sync_live;
-    e->in_use = 0;
-    // A free entry's key is the free list's next link.
-    e->key = g_header->sync_free_head;
-    g_header->sync_free_head = static_cast<uint32_t>(e - g_sync) + 1;
-    if (g_header->sync_tombstones > (g_sync_index_mask + 1) / 4) {
-        index_rebuild();
-    }
+    arena_free(kClassVC, e->clock);
+    e->state = kSyncDead;
+    --s->live;
+    ++s->dead;
 }
 
 } // namespace
 
-VectorClock sync_s(uint64_t key) {
-    SyncEntry* e = find(key);
-    if (e == nullptr || e->s_off == 0) {
-        return VectorClock(); // the zero clock: nothing to acquire here
-    }
-    return VectorClock(static_cast<uint32_t*>(arena_at(e->s_off)));
+// seq is odd while a writer holds the stripe. Already odd means a writer died
+// holding it and the lock was taken over.
+SyncRef::SyncRef(uint64_t key) : key_(key), stripe_(stripe_of(key)) {
+    spin_lock(&stripe_->lock);
+    __atomic_store_n(&stripe_->seq, stripe_->seq | 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    SyncEntry* unused;
+    entry_ = probe(stripe_, key, &unused);
 }
 
-void sync_s_set(uint64_t key, const VectorClock& c) {
-    SyncEntry* e = find_or_add(key);
-    if (e == nullptr) {
-        return;
+SyncRef::~SyncRef() {
+    __atomic_store_n(&stripe_->seq, stripe_->seq + 1, __ATOMIC_RELEASE);
+    spin_unlock(&stripe_->lock);
+}
+
+VectorClock SyncRef::clock() const {
+    return entry_ != nullptr ? VectorClock(static_cast<uint32_t*>(arena_at(entry_->clock)))
+                             : VectorClock();
+}
+
+VectorClock SyncRef::clock_or_add() {
+    if (entry_ != nullptr) {
+        return clock();
     }
-    if (e->s_off == 0) {
-        uint32_t off = arena_alloc(kClassVC);
-        if (off == 0) {
-            return;
+    // Keep a quarter of the stripe empty, so every probe ends.
+    if (stripe_->live + stripe_->dead >= g_sync_slots / 4 * 3 && stripe_->dead > 0) {
+        rebuild(stripe_);
+    }
+    uint32_t off = 0;
+    if (stripe_->live + stripe_->dead >= g_sync_slots / 4 * 3 ||
+        (off = arena_alloc(kClassVC)) == 0) {
+        if (atomic_fetch_add_u64(&g_header->clock_table_full, 1) == 0) {
+            std::fprintf(stderr,
+                         "CSAN: sync table full -- happens-before through new locks and atomic "
+                         "locations is lost, so FALSE REPORTS are expected from here on. Raise "
+                         "CSAN_CLOCK_ENTRIES (or CSAN_ARENA).\n");
+            fflush(stderr);
         }
-        e->s_off = off;
+        return VectorClock();
     }
-    VectorClock(static_cast<uint32_t*>(arena_at(e->s_off))).copy_from(c);
+    SyncEntry* slot;
+    probe(stripe_, key_, &slot);
+    if (slot->state == kSyncDead) {
+        --stripe_->dead;
+    }
+    *slot = SyncEntry{key_, kSyncLive, off};
+    ++stripe_->live;
+    entry_ = slot;
+    return clock();
 }
 
-void sync_s_merge(uint64_t key, const VectorClock& c) {
-    SyncEntry* e = find_or_add(key);
-    if (e == nullptr) {
-        return;
-    }
-    if (e->s_off == 0) {
-        uint32_t off = arena_alloc(kClassVC);
-        if (off == 0) {
-            return;
+void SyncRef::erase() {
+    drop(stripe_, entry_);
+    entry_ = nullptr;
+}
+
+void SyncRef::erase_byte(uint64_t key) {
+    SyncEntry* unused;
+    drop(stripe_, probe(stripe_, key, &unused));
+}
+
+void sync_join(uint64_t key, VectorClock into) {
+    SyncStripe* s = stripe_of(key);
+    uint32_t copy[kMaxThreads];
+    for (int tries = 0; tries < 64; ++tries) {
+        uint32_t seq = __atomic_load_n(&s->seq, __ATOMIC_ACQUIRE);
+        if ((seq & 1) != 0) {
+            __builtin_ia32_pause();
+            continue;
         }
-        e->s_off = off;
-    }
-    VectorClock(static_cast<uint32_t*>(arena_at(e->s_off))).merge(c);
-}
-
-void sync_s_clear(uint64_t key) {
-    SyncEntry* e = find(key);
-    if (e != nullptr) {
-        release_entry(e);
-    }
-}
-
-void sync_clear_range(uint64_t begin, uint64_t end) {
-    if (atomic_load_u32(&g_header->release_count) == 0) {
-        return;
-    }
-    spin_lock(&g_header->global_lock);
-    uint32_t live = g_header->sync_live;
-    if (live != 0 && end - begin <= live) {
-        // Fewer keys in the range than live entries: look each one up.
-        for (uint64_t k = begin; k < end; ++k) {
-            SyncEntry* e = find(k);
-            if (e != nullptr) {
-                release_entry(e);
-            }
-        }
-    } else if (live != 0) {
-        uint32_t n = g_header->release_count;
+        SyncEntry* unused;
+        SyncEntry* e = probe(s, key, &unused);
+        uint32_t clock = e != nullptr ? __atomic_load_n(&e->clock, __ATOMIC_RELAXED) : 0;
+        uint32_t n = clock != 0 ? live_threads() : 0;
+        const uint32_t* row = static_cast<const uint32_t*>(arena_at(clock));
         for (uint32_t i = 0; i < n; ++i) {
-            SyncEntry* e = &g_sync[i];
-            if (e->in_use && e->key >= begin && e->key < end) {
-                release_entry(e);
+            copy[i] = __atomic_load_n(&row[i], __ATOMIC_RELAXED);
+        }
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&s->seq, __ATOMIC_RELAXED) == seq) {
+            if (n != 0) {
+                into.merge(VectorClock(copy));
             }
+            return;
         }
     }
-    spin_unlock(&g_header->global_lock);
+    SyncRef r(key); // writers keep changing it, or one died mid-change
+    into.merge(r.clock());
+}
+
+uint32_t sync_live() {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < kSyncStripes; ++i) {
+        n += __atomic_load_n(&g_sync_stripes[i].live, __ATOMIC_RELAXED);
+    }
+    return n;
 }
 
 } // namespace csan

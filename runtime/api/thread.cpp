@@ -15,12 +15,9 @@
 
 using namespace csan;
 
-// ---- process creation ------------------------------------------------------
-//
-// fork() is interposed so the Fork edge is taken from the parent's clock as of
-// the fork, not later. The forking thread copies its clock into private memory just before the real
-// fork, so the child inherits the copy, then ticks in the parent. csan_spawn
-// (api_lifecycle.cpp) merges the copy.
+// ---- fork ----
+// The parent's clock is copied just before the real fork so the child inherits
+// it as of the fork; csan_spawn merges it. The parent then ticks.
 
 extern "C" pid_t fork(void) {
     static pid_t (*real_fork)(void) =
@@ -47,15 +44,10 @@ extern "C" pid_t fork(void) {
     return pid;
 }
 
-// ---- thread creation -------------------------------------------------------
-//
-// The parent's clock must reach the child BEFORE it runs any user code; after
-// pthread_create returns is too late, since the child may already be running.
-//
-// pthread_create is interposed. A strong definition here overrides libc's for
-// the whole program, libstdc++'s std::thread included, so every thread is
-// covered without the pass recognizing how it was created. The child's thread
-// id and clock are assigned in the PARENT; the trampoline adopts them.
+// ---- thread creation ----
+// Interposing pthread_create covers std::thread too. The child's id and clock
+// are set in the parent before it starts, since it may run user code before
+// pthread_create returns; the trampoline adopts them.
 
 namespace {
 
@@ -75,9 +67,7 @@ void* csan_thread_trampoline(void* p) {
     if (tid != UINT32_MAX && g_attached) {
         t_tid = tid;
         spin_lock(&g_header->global_lock);
-        // Record the mapping here rather than in the parent: the parent cannot
-        // do it until pthread_create returns, by which time this thread may
-        // already have run and exited.
+        // Not in the parent: this thread may exit before pthread_create returns.
         thread_ids()[pthread_self()] = tid;
         spin_unlock(&g_header->global_lock);
     }

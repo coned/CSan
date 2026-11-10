@@ -11,23 +11,9 @@ static ReadList* block_at(uint32_t off) {
     return static_cast<ReadList*>(arena_at(off));
 }
 
-// A fresh block: arena_alloc zeroes it, and zero is not kEpochBot, so the
-// entries are stamped empty explicitly.
-static uint32_t block_new() {
-    uint32_t off = arena_alloc(kClassReadList);
-    if (off == 0) {
-        return 0;
-    }
-    ReadList* b = block_at(off);
-    for (uint32_t i = 0; i < kReadListEntries; ++i) {
-        b->e[i] = kEpochBot;
-    }
-    b->next = 0;
-    return off;
-}
-
+// Zeroed block: every entry starts as kEpochBot.
 uint32_t readlist_new(Epoch first) {
-    uint32_t off = block_new();
+    uint32_t off = arena_alloc(kClassReadList);
     if (off != 0) {
         block_at(off)->e[0] = first;
     }
@@ -57,7 +43,7 @@ bool readlist_raise(uint32_t off, uint32_t t, uint32_t c) {
         *free_slot = epoch_make(t, c);
         return true;
     }
-    uint32_t grown = block_new();
+    uint32_t grown = arena_alloc(kClassReadList);
     if (grown == 0) {
         return false;
     }

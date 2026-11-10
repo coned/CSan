@@ -16,9 +16,11 @@ uint64_t g_trace_lo = 0;
 uint64_t g_trace_hi = 0;
 bool g_trace_on = false;
 uint64_t g_report_limit = 100;
+bool g_report_off = false;
+bool g_report_once = true;
 
-bool trace_hit(uintptr_t addr) {
-    if (!g_trace_on || g_pool == nullptr) {
+bool trace_in_range(uintptr_t addr) {
+    if (g_pool == nullptr) {
         return false;
     }
     uint64_t off = shadow_offset(addr);
@@ -40,16 +42,52 @@ void trace_event(const char* what, uintptr_t addr, uint32_t tid, const char* not
 
 // Indexed by CSAN_RACE_*; the order there is the order here.
 static const char* const kRaceKindNames[CSAN_RACE_KIND_COUNT] = {
-    "read-before-hb-write",       "read-without-byte-acquire",
-    "write-before-hb-line-write", "write-after-read",
-    "write-without-line-acquire", "atomic-write-without-line-acquire", "data-race",
+    "data-race-wr",               "read-without-byte-acquire",
+    "retired",                    "data-race-rw",
+    "write-without-line-acquire", "atomic-write-without-line-acquire", "data-race-ww",
+    "write-without-publish",
 };
 
 const char* race_kind_name(uint32_t kind) {
     return kind < CSAN_RACE_KIND_COUNT ? kRaceKindNames[kind] : "?";
 }
 
-void report_race(uint32_t kind, uintptr_t addr, uint32_t tid, Epoch other) {
+// One writer per counter slot (the reporting thread), so no shared cache line.
+static void count_race(uint32_t kind, uint32_t tid) {
+    if (tid >= kMaxThreads) {
+        return;
+    }
+    ThreadCounts& c = g_header->counts[tid];
+    count_add(&c.races, 1);
+    if (kind < CSAN_RACE_KIND_COUNT) {
+        count_add(&c.race_kind[kind], 1);
+    }
+}
+
+void report_race(uint32_t kind, uintptr_t addr, uint32_t tid, Epoch other, uintptr_t other_addr) {
+    count_race(kind, tid);
+    if (g_report_off) {
+        return;
+    }
+    // Past the print limit only the counts change: no text, no global lock,
+    // and no shared index once the limit is known to be reached.
+    if (g_report_limit != 0 && atomic_load_u32(&g_header->report_head) > g_report_limit) {
+        return;
+    }
+    uint64_t seen = atomic_fetch_add_u32(&g_header->report_head, 1);
+    bool print = g_report_limit == 0 || seen < g_report_limit;
+    if (!print) {
+        if (seen == g_report_limit) {
+            spin_lock(&g_header->global_lock);
+            std::fprintf(stderr,
+                         "CSAN: report limit %" PRIu64 " reached; further findings are counted"
+                         " but not printed (set CSAN_REPORT_LIMIT, 0 for unlimited)\n",
+                         g_report_limit);
+            fflush(stderr);
+            spin_unlock(&g_header->global_lock);
+        }
+        return;
+    }
     const char* name = race_kind_name(kind);
     char buf[512];
     uint64_t off = cxl_contains(addr, 1) ? shadow_offset(addr) : UINT64_MAX;
@@ -68,37 +106,18 @@ void report_race(uint32_t kind, uintptr_t addr, uint32_t tid, Epoch other) {
                  name, off, addr, tid, machine_of(tid));
     }
     spin_lock(&g_header->global_lock);
-    // report_head counts every finding ever emitted, across machines, so the
-    // limit caps the whole run's output and not one process's share of it.
-    uint64_t seen = g_header->report_head;
-    bool print = g_report_limit == 0 || seen < g_report_limit;
-    uint32_t head = g_header->report_head % 64;
+    uint32_t head = static_cast<uint32_t>(seen % 64);
     std::snprintf(g_header->report_lines[head], sizeof(g_header->report_lines[head]), "%s", buf);
-    ++g_header->report_head;
-    // Print inside the critical section so concurrent reports never interleave.
-    if (!print) {
-        if (seen == g_report_limit) {
-            std::fprintf(stderr,
-                         "CSAN: report limit %" PRIu64 " reached; further findings are counted"
-                         " but not printed (set CSAN_REPORT_LIMIT, 0 for unlimited)\n",
-                         g_report_limit);
-            fflush(stderr);
-        }
-    } else if (tracing()) {
+    // Print under the lock so reports never interleave.
+    if (tracing()) {
         trace_print_finding(stderr, kind, addr, 1, tid,
-                            other != kEpochBot ? epoch_tid(other) : UINT32_MAX);
+                            other != kEpochBot ? epoch_tid(other) : UINT32_MAX,
+                            other_addr != 0 ? other_addr : addr);
     } else {
         fputs(buf, stderr);
     }
-    if (print) {
-        fflush(stderr);
-    }
+    fflush(stderr);
     spin_unlock(&g_header->global_lock);
-    atomic_fetch_add_u64(&g_header->race_events, 1);
-    if (kind < CSAN_RACE_KIND_COUNT) {
-        atomic_fetch_add_u64(&g_header->race_kind[kind], 1);
-    }
 }
-
 
 } // namespace csan

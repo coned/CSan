@@ -30,7 +30,6 @@ void add_range_locked(uintptr_t base, uintptr_t end) {
     }
 }
 
-// Returns the end of the range that was removed, or 0 if there was none.
 uintptr_t remove_range_locked(uintptr_t base) {
     for (uint32_t i = 0; i < g_header->range_count; ++i) {
         SharedRange& r = g_header->ranges[i];
@@ -42,14 +41,9 @@ uintptr_t remove_range_locked(uintptr_t base) {
     return 0;
 }
 
-// Set or clear kHwCcBit on every line [base, base+size) touches.
-//
-// Allocations are kAlign = 64 = kLineBytes aligned and padded, so a region
-// always starts on a line boundary and no line ever carries two regions --
-// marking by line can never speak for memory the caller did not name.
-//
-// No line lock: this runs at registration, before the region is handed to the
-// program, and the flag is a byte of its own that the access path only reads.
+// Exact per line: allocations are line-aligned and padded, so no line spans
+// two regions. No line lock: runs before the program uses the region, and the
+// access path only reads the flag.
 void mark_hwcc_lines(uintptr_t base, size_t size, bool on) {
     uintptr_t end = base + static_cast<uintptr_t>(size);
     for (uintptr_t line = base & ~(kLineBytes - 1); line < end; line += kLineBytes) {
@@ -92,9 +86,7 @@ void* csan_alloc(size_t size) {
     return g_pool + off;
 }
 
-// The region every machine knows by `id`: the first caller carves it out of
-// the pool and the rest get the same one back. Backed by the root table, so an
-// id is a root index and the two share the kMaxRoots slots.
+// Region ids are root indices; they share the kMaxRoots slots.
 void* csan_shared_region(uint32_t id, size_t size) {
     if (!g_attached || id >= kMaxRoots) {
         return nullptr;
@@ -176,10 +168,7 @@ void csan_unregister_range(void* base) {
     __csan_unregister_range(base);
 }
 
-// ---- support for compatibility layers ---------------------------------------
-//
-// A compatibility layer stands in for another system's pool API on top of this
-// runtime. These are the runtime internals such a layer is allowed to reach.
+// ---- compatibility layers ----
 
 void* __csan_pool_base(void) {
     return g_attached ? g_pool : nullptr;
@@ -206,15 +195,8 @@ void __csan_register_range(void* base, size_t size) {
     spin_unlock(&g_header->global_lock);
 }
 
-// The two kinds of CXL memory a program can declare.
-//
-// Software-coherent is the default and needs no call: the segment starts zeroed
-// and csan_alloc clears the flag.
-//
-// Hardware-coherent opts out of the visibility checks only. The checker records
-// and reports nothing for those bytes, but a lock or atomic living there still
-// carries its happens-before edges, since those order accesses to memory that
-// IS checked (rules_access, rules_visibility).
+// hwcc skips visibility checks only; locks and atomics there still carry
+// happens-before for checked memory.
 static void register_range_as(void* base, size_t size, bool hwcc) {
     __csan_register_range(base, size);
     if (!g_attached || base == nullptr || size == 0) {
@@ -243,7 +225,7 @@ void __csan_unregister_range(void* base) {
     spin_lock(&g_header->global_lock);
     uintptr_t end = remove_range_locked(b);
     spin_unlock(&g_header->global_lock);
-    // Reset the lines to the default so a later registration starts clean.
+    // Back to software-coherent for a later registration.
     if (end > b) {
         mark_hwcc_lines(b, static_cast<size_t>(end - b), /*on=*/false);
     }
@@ -256,9 +238,7 @@ int __csan_is_cxl(const void* addr, size_t n) {
     return cxl_contains(reinterpret_cast<uintptr_t>(addr), n) ? 1 : 0;
 }
 
-// Watch memory the checker did not allocate. `id` names the region; every
-// machine that maps it registers it under the same id, and the state is keyed
-// by (id, offset) so each machine may map it wherever it likes.
+// Shadow is keyed by (id, offset), so each machine may map it anywhere.
 void csan_watch(uint32_t id, void* base, size_t size) {
     if (base == nullptr || size == 0) {
         return;
@@ -269,8 +249,7 @@ void csan_watch(uint32_t id, void* base, size_t size) {
     }
     uint64_t n = align_up(static_cast<uint64_t>(size), kLineBytes);
     uintptr_t b = reinterpret_cast<uintptr_t>(base);
-    // A line is the unit of every visibility obligation, so a region that began
-    // mid-line would share its first line with memory nobody watched.
+    // A mid-line start would share a line with unwatched memory.
     if ((b & (kLineBytes - 1)) != 0) {
         std::fprintf(stderr, "CSAN: watched region %u is not line-aligned (0x%012" PRIxPTR ")\n",
                      id, b);
@@ -287,8 +266,7 @@ void csan_watch(uint32_t id, void* base, size_t size) {
     }
     if (slot == kMaxWatchRegions && g_header->watch_count < kMaxWatchRegions &&
         g_header->watch_bump + n <= g_header->cxl_size + g_header->watch_size) {
-        // The first machine to name this region fixes its size and its place in
-        // the shadow; the others only record where they mapped it.
+        // The first machine fixes size and shadow slot.
         slot = g_header->watch_count++;
         g_header->watch[slot].id = id;
         g_header->watch[slot].size = n;
@@ -315,8 +293,11 @@ void csan_watch(uint32_t id, void* base, size_t size) {
                      static_cast<unsigned long long>(n));
         return;
     }
-    g_watch_base[slot] = b;
-    ++g_region_gen; // every thread here re-resolves before trusting a cached region
+    uint64_t shadow_off = g_header->watch[slot].shadow_off;
+    g_regions[1 + slot] = Region{b, b + n, shadow_off - static_cast<uint64_t>(b)};
+    if (g_region_count < 2 + slot) {
+        __atomic_store_n(&g_region_count, 2 + slot, __ATOMIC_RELEASE);
+    }
 }
 
 } // extern "C"

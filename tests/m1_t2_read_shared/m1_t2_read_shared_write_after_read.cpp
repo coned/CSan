@@ -41,11 +41,11 @@ int main() {
         std::this_thread::yield();
     }
 
-    x[0] = 2; // write-after-read against all eight readers
+    x[0] = 2; // data-race-rw against all eight readers
 
     go.store(true, std::memory_order_relaxed);
     for (std::thread& t : ts) {
         t.join();
     }
-    return csan_expect_race(CSAN_RACE_WRITE_AFTER_READ).finish();
+    return csan_expect_race(CSAN_RACE_DATA_RACE_RW).finish();
 }

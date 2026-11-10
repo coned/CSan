@@ -35,6 +35,7 @@ int main() {
 
     *s.x = 1;
     _mm_clwb(const_cast<uint64_t*>(s.x));
+    _mm_clwb(s.flag); // its constructor's plain store, which machine 1 overwrites
     _mm_sfence();
 
     pid_t child = csan_test_spawn_machine(kHosts, 1, &reader, &s);

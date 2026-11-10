@@ -7,7 +7,6 @@
 #include "base/spinlock.h"
 #include "state/state.h"
 
-
 using namespace csan;
 
 extern "C" {
@@ -31,15 +30,15 @@ const char* __csan_report(void) {
 }
 
 uint64_t __csan_read_events(void) {
-    return g_attached ? atomic_load_u64(&g_header->read_events) : 0;
+    return g_attached ? count_total(&ThreadCounts::reads) : 0;
 }
 
 uint64_t __csan_write_events(void) {
-    return g_attached ? atomic_load_u64(&g_header->write_events) : 0;
+    return g_attached ? count_total(&ThreadCounts::writes) : 0;
 }
 
 uint64_t __csan_race_events(void) {
-    return g_attached ? atomic_load_u64(&g_header->race_events) : 0;
+    return g_attached ? count_total(&ThreadCounts::races) : 0;
 }
 
 uint64_t __csan_overflow_count(void) {
@@ -50,7 +49,7 @@ uint64_t __csan_race_kind_count(uint32_t kind) {
     if (!g_attached || kind >= CSAN_RACE_KIND_COUNT) {
         return 0;
     }
-    return atomic_load_u64(&g_header->race_kind[kind]);
+    return race_kind_total(kind);
 }
 
 const char* __csan_race_kind_name(uint32_t kind) {

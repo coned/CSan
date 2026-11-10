@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: MIT
-// Relaxed and acquire/release accessors for words in the shared segment.
-//
-// Plain __atomic builtins on MAP_SHARED memory. They are what makes a field
-// safe to touch from several machine processes at once; nothing here implies
-// any ordering on the checked program, only on the checker's own metadata.
+// Atomic accessors for the checker's own metadata in the shared segment.
+// They order only that metadata, never the checked program.
 #ifndef CSAN_ATOMICS_H
 #define CSAN_ATOMICS_H
 

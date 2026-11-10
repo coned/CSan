@@ -10,38 +10,44 @@
 
 namespace csan {
 
-// CSAN_TRACE_RANGE="<lo>:<hi>" (pool offsets, hex accepted) logs every read,
-// write, release, acquire, write-back and flush the checker sees inside that
-// range, with the acting thread's clock. A write-back or flush line also says
-// whether it recorded anything, which is how a flush that acquires nothing is
-// told from one that never ran. Set by csan_ensure_init.
+// CSAN_TRACE_RANGE="<lo>:<hi>" (pool offsets): log every event in the range
+// with the acting thread's clock. Set by csan_ensure_init.
 extern uint64_t g_trace_lo;
 extern uint64_t g_trace_hi;
 extern bool g_trace_on;
 
-// How many findings a run prints before it goes quiet. CSAN_REPORT_LIMIT sets
-// it; 0 means no limit. Counting is unaffected, so csan_race_events() and the
-// per-kind totals stay exact after the limit is hit.
+// CSAN_REPORT_LIMIT: findings printed per run, 0 = unlimited. Counts stay exact.
 extern uint64_t g_report_limit;
+// CSAN_REPORT_LIMIT=off: print nothing and take no lock; only the counts move.
+extern bool g_report_off;
+// CSAN_REPORT_ONCE (default on; 0 turns it off): after a finding at a byte,
+// skip that byte's checks, as TSan stops checking a racy word.
+extern bool g_report_once;
 
-// Is this address inside the traced range?
-bool trace_hit(uintptr_t addr);
+bool trace_in_range(uintptr_t addr);
 
-// One trace line. `what` names the event, `note` is free-form context.
+inline bool trace_hit(uintptr_t addr) {
+    return g_trace_on && trace_in_range(addr);
+}
+
 void trace_event(const char* what, uintptr_t addr, uint32_t tid, const char* note);
 
-// The name of a finding kind (CSAN_RACE_* in csan_runtime.h): the string that
-// appears in its CSAN RACE line. "?" for a kind out of range.
+// Log an event at `addr` if CSAN_TRACE_RANGE covers it.
+inline void trace_access(const char* what, uintptr_t addr, uint32_t tid, const char* note = "") {
+    if (trace_hit(addr)) {
+        trace_event(what, addr, tid, note);
+    }
+}
+
+// Name of a CSAN_RACE_* kind; "?" if out of range.
 const char* race_kind_name(uint32_t kind);
 
-// Emit a finding: appends to the shared ring the report API reads, writes it
-// to stderr, and counts it -- both in the total and under its own kind, which
-// is what a test asserts on. `other` is the epoch the access conflicted with,
-// where there is one.
-//
-// Takes the global lock, and that lock is NOT recursive: never call this while
-// holding it.
-void report_race(uint32_t kind, uintptr_t addr, uint32_t tid, Epoch other = kEpochBot);
+// Record, print and count a finding. `other` is the conflicting epoch, if any;
+// `other_addr` the byte it wrote, when that is not `addr` (a line kind: the
+// byte left on the line). Takes the global lock (not recursive): caller must
+// not hold it.
+void report_race(uint32_t kind, uintptr_t addr, uint32_t tid, Epoch other = kEpochBot,
+                 uintptr_t other_addr = 0);
 
 } // namespace csan
 

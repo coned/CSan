@@ -46,5 +46,4 @@ void arena_free(uint32_t cls, uint32_t off) {
     spin_unlock(&g_header->arena_lock);
 }
 
-
 } // namespace csan

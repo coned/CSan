@@ -31,5 +31,5 @@ int main() {
     flag->store(2, std::memory_order_relaxed); // same thread: ENDS it anyway
     middle.join();
     reader.join();
-    return csan_expect_race(CSAN_RACE_READ_BEFORE_HB_WRITE).races(1).finish();
+    return csan_expect_race(CSAN_RACE_DATA_RACE_WR).races(1).finish();
 }

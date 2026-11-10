@@ -23,5 +23,5 @@ int main() {
     }
     *reinterpret_cast<volatile uint64_t*>(x) = 42; // the whole word, no edge from the read
     reader.join();
-    return csan_expect_race(CSAN_RACE_WRITE_AFTER_READ).finish();
+    return csan_expect_race(CSAN_RACE_DATA_RACE_RW).finish();
 }

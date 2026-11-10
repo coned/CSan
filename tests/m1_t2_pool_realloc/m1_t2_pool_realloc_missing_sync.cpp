@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Unsynchronized write and read on memory from csan_realloc: it must still be checked.
-// Expected: race (read-before-hb-write).
+// Expected: race (data-race-wr).
 #include "csan_runtime.h"
 #include "csan_test.h"
 
@@ -39,5 +39,5 @@ int main() {
     });
     writer.join();
     reader.join();
-    return csan_expect_race(CSAN_RACE_READ_BEFORE_HB_WRITE).finish();
+    return csan_expect_race(CSAN_RACE_DATA_RACE_WR).finish();
 }

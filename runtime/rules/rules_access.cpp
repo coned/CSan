@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
-// Read and Write for plain accesses, the visibility predicates and Install
-// they use, and the walk that applies them to every byte of a range.
+// The rules Load and Store, their premises, and the Store update. The walk
+// over lines, words and split cells is repr/walk.h.
 #include "rules/rules.h"
 
 #include "base/atomics.h"
@@ -8,285 +8,266 @@
 #include "base/trace.h"
 #include "repr/shadow.h"
 #include "repr/slotmap.h"
-#include "repr/sync.h"
+#include "repr/walk.h"
 
 #include <algorithm>
 
 namespace csan {
 
-// ---- visibility predicates ---------------------------------------------------
+// ---- R_x, the reads of a byte since its last write ----
+// FastTrack's adaptive form. While the reads are ordered by happens-before,
+// the last one follows all the others, so its epoch alone decides
+// R_x ⊑ C_u for every later writer u. From the first concurrent read, R_x
+// is a ReadList with each thread's latest read. Storage: repr/shadow.h.
 
-// ReadVis(x,t) ⟺ mach(thr(W^B_x)) = mach(t) ∨ Acq^B(x, mach(t), ℂ_t)
-//
-// A byte nobody has written is trivially visible. Acq^B is consulted only when
-// the writer was on another machine, which is why 𝔸^B_x is read nowhere else.
-bool read_vis(const ByteCell* x, uint32_t t) {
-    if (x->wb == kEpochBot) {
+// R_x ⊑ C_t
+static inline bool rd_le(const ByteCell* x, uint32_t t) {
+    return cell_rd_shared(x) ? readlist_le(cell_rd_off(x), t) : thread_vc(t).covers(x->rd);
+}
+
+// R_x ← addRead(R_x, t), FastTrack's three read cases:
+//   R_x an epoch ⊑ C_t   this read follows it: this read's epoch replaces it,
+//                        whichever thread made it (always so for t's own);
+//   R_x an epoch ⋢ C_t   a concurrent read: both go into a ReadList;
+//   R_x a ReadList       raise t's entry.
+static inline void add_read(ByteCell* x, uint32_t t) {
+    uint32_t now = vc_get(t, t);
+    if (cell_rd_shared(x)) {
+        readlist_raise(cell_rd_off(x), t, now);
+    } else if (x->rd == kEpochBot || thread_vc(t).covers(x->rd)) {
+        x->rd = epoch_make(t, now);
+    } else {
+        rd_to_list(x, t, now);
+    }
+}
+
+// ---- the premises Load and Store add (formulas in rules.h) ----
+
+bool load_acq_premise(const ByteCell* x, uint32_t t) {
+    if (x->wb == kEpochBot || machine_of(epoch_tid(x->wb)) == machine_of(t)) {
         return true;
     }
-    return machine_of(epoch_tid(x->wb)) == machine_of(t) || acq_ok(cell_acq_off(x), t);
+    return acq_r(x, t);
 }
 
-// WriteVis(ℓ,t) ⟺ mach(thr(W^L_ℓ)) = mach(t) ∨ Acq^L(ℓ, mach(t), ℂ_t)
-bool write_vis(const LineCell* l, uint32_t t) {
-    if (l->wl == kEpochBot) {
+bool store_pub_premise(const ByteCell* x, uint32_t t) {
+    if (x->wb == kEpochBot || machine_of(epoch_tid(x->wb)) == machine_of(t)) {
         return true;
     }
-    return machine_of(epoch_tid(l->wl)) == machine_of(t) || acq_ok(l->acq, t);
+    return cell_atomic_store(x) || pub_b(x, t);
 }
 
-// WriteVisFull(ℓ,t) ⟺ mach(thr(W^L_ℓ)) = mach(t) ∨ Pub^L(ℓ, ℂ_t) ∨ Acq^L(ℓ, mach(t), ℂ_t)
-//
-// The premise for a store covering the whole line: no stale copy can ride
-// back out, so no invalidate is needed, but the previous writer's line must
-// still be published or its pending write-back would overwrite this store.
-// Acq^L stays as an alternative so this is a pure weakening of WriteVis.
-bool write_vis_full_line(const LineCell* l, uint32_t t) {
-    if (l->wl == kEpochBot) {
-        return true;
-    }
-    if (machine_of(epoch_tid(l->wl)) == machine_of(t)) {
-        return true;
-    }
-    return pub_ok(l->pub, t) || acq_ok(l->acq, t);
+bool store_acq_premise(const ByteCell* y, uint32_t t) {
+    return y->wb == kEpochBot || acq_w(y, t);
 }
 
-// Install_{x,E}: W^B_x, W^L_ℓ ← E; ℝ_x ← 0; ℙ^B_x, 𝔸^B_x, ℙ^L_ℓ, 𝔸^L_ℓ ← ∅.
-// It does not reset the byte relays of other bytes on the same line.
-void install(ByteCell* x, LineCell* l, Epoch E) {
-    rd_reset(x);
-    uint32_t p = cell_pub_off(x);
-    slotmap_release(&p);
-    cell_set_pub_off(x, p);
-    uint32_t q = cell_acq_off(x);
-    slotmap_release(&q);
-    cell_set_acq_off(x, q);
-    x->wb = E;
-    l->wl = E;
-    slotmap_release(&l->pub);
-    slotmap_release(&l->acq);
-}
-
-// ---- the rules, per byte cell -----------------------------------------------
-//
-// One cell stands for one byte, or for a whole word while its eight bytes still
-// share a cell (see ByteCell). The caller holds the line's lock.
-
-// Read(x,t):       W^B_x ⊑ ℂ_t  ∧  ReadVis(x,t)    ⟹  ℝ_x[t] ← ℂ_t[t];  atomic_x ← ⊥
-// LoadRlx/LoadAcq: atomic_x = ⊤ ∨ W^B_x ⊑ ℂ_t                ⟹  ..., atomic_x ← ⊤
-//
-// Atomicity discharges the ordering premise when the byte's previous access was
-// atomic too. An atomic access is also exempt from the visibility premise: the
-// C++ standard requires no timeliness. A plain access is never exempt.
-static void read_byte(ByteCell* x, uintptr_t addr, uint32_t t, bool atomic) {
-    bool both_atomic = atomic && cell_atomic(x);
-    if (!both_atomic && !epoch_le(x->wb, t)) {
-        report_race(CSAN_RACE_READ_BEFORE_HB_WRITE, addr, t, x->wb);
+void store_update(ByteCell* x, uint32_t t, Epoch now) {
+    uint32_t m = machine_of(t);
+    bool moved = x->wb != kEpochBot && machine_of(epoch_tid(x->wb)) != m;
+    rd_clear(x); // R_x ↦ ⊥
+    if (moved) {
+        // (W'_x, P'_x) ↦ (W_x, P_x); the old P'_x's block is reused for P_x
+        uint32_t p = cell_pub_off(x);
+        cell_set_pub_off(x, x->pprev);
+        x->pprev = p;
+        x->wprev = x->wb;
     }
-    if (!atomic && !read_vis(x, t)) {
-        report_race(CSAN_RACE_READ_WITHOUT_BYTE_ACQUIRE, addr, t, x->wb);
-    }
-    if (trace_hit(addr)) {
-        trace_event("READ", addr, t, "");
-    }
-    rd_set(x, t);
-    cell_set_atomic(x, atomic);
-}
-
-// Write(x,t):  W^B_x ⊑ ℂ_t  ∧  LineOrd(ℓ,x,t)  ∧  ℝ_x ⊑ ℂ_t  ∧  WriteVis(ℓ,t)  ⟹  Install_{x,E};  atomic_x ← ⊥
-//   LineOrd(ℓ,x,t) ⟺ W^L_ℓ = W^B_x ∨ mach(thr(W^L_ℓ)) = mach(t) ∨ W^L_ℓ ⊑ ℂ_t
-// The store rules: atomic_x = ⊤ ∨ (W^B_x ⊑ ℂ_t ∧ LineOrd(ℓ,x,t) ∧ ℝ_x ⊑ ℂ_t)  ⟹  ..., atomic_x ← ⊤
-// An atomic store is exempt from the per-byte WriteVis check: the line-level
-// hazard it can still cause is checked once per line, in
-// check_atomic_line_write, which is where two atomic stores to different
-// locations on one line are caught.
-static void write_byte(ByteCell* x, LineCell* l, uintptr_t addr, uint32_t t, Epoch E,
-                       bool atomic, bool covers_line) {
-    bool both_atomic = atomic && cell_atomic(x);
-    if (!both_atomic && !epoch_le(x->wb, t)) {
-        report_race(CSAN_RACE_DATA_RACE, addr, t, x->wb);
-    }
-    // Only another machine's write-back of a different byte can lose this one.
-    if (!both_atomic && l->wl != x->wb && !epoch_le(l->wl, t) &&
-        machine_of(epoch_tid(l->wl)) != machine_of(t)) {
-        report_race(CSAN_RACE_WRITE_BEFORE_HB_LINE_WRITE, addr, t, l->wl);
-    }
-    if (!both_atomic && !rd_le(x, t)) {
-        report_race(CSAN_RACE_WRITE_AFTER_READ, addr, t);
-    }
-    // Only this premise weakens for a whole-line store; the two above are about
-    // ordering, which covering the line does nothing for.
-    if (!atomic && !(covers_line ? write_vis_full_line(l, t) : write_vis(l, t))) {
-        report_race(CSAN_RACE_WRITE_WITHOUT_LINE_ACQUIRE, addr, t, l->wl);
-    }
-    if (trace_hit(addr)) {
-        trace_event("WRITE", addr, t, "");
-    }
-    install(x, l, E);
-    if (uint32_t* pos = write_pos_at(addr)) {
-        *pos = trace_cur_pos();
-        *line_pos_at(addr) = trace_cur_pos();
-    }
-    cell_set_atomic(x, atomic);
-}
-
-// Two ATOMIC writes to one line from two machines, at DIFFERENT locations.
-// Each writes the whole line back carrying its stale copy of the other's bytes,
-// so one value is lost: the unit moving between a cache and CXL memory is the
-// line, not the location. Two atomic writes to the SAME location are not this
-// and are not reported.
-//
-// Cleared by the chain a plain write needs -- write, clwb, sfence, then
-// clflushopt, sfence on the other machine -- which is WriteVis. The clwb and
-// sfence the runtime injects around an atomic store (rules_sync.cpp) are real
-// instructions, not events, and do not count.
-static void check_atomic_line_write(LineCell* l, uintptr_t addr, uint32_t t, uint32_t off,
-                                    uint32_t len) {
-    if (l->wl == kEpochBot || l->wl_len == 0) {
-        return; // nothing has written this line yet
-    }
-    if (l->wl_off == off && l->wl_len == len) {
-        return; // the same location: no line hazard
-    }
-    if (write_vis(l, t)) {
-        return; // this machine owns the line, or it acquired it
-    }
-    report_race(CSAN_RACE_ATOMIC_WRITE_WITHOUT_LINE_ACQUIRE, addr, t, l->wl);
-}
-
-// ---- the walk over a byte range ---------------------------------------------
-
-// Visit the words of [begin, begin+n) one line at a time, holding that line's
-// lock: f(lc, word, lo, hi) for each word, where [lo, hi) is the part of the
-// word the range covers. Hardware-coherent lines are skipped whole.
-template <class F>
-static void for_each_covered_word(uintptr_t begin, size_t n, F f) {
-    uintptr_t end = begin + static_cast<uintptr_t>(n);
-    uintptr_t a = begin;
-    while (a < end) {
-        uintptr_t line = a & ~(kLineBytes - 1);
-        uintptr_t line_end = std::min(end, line + kLineBytes);
-        LineCell* lc = line_cell_at(line);
-        if (line_is_hwcc(lc)) {
-            a = line_end;
-            continue;
-        }
-        line_lock(lc);
-        while (a < line_end) {
-            uintptr_t word = a & ~(kWordBytes - 1);
-            uintptr_t hi = std::min(line_end, word + kWordBytes);
-            f(lc, word, a, hi);
-            a = hi;
-        }
-        line_unlock(lc);
-    }
-}
-
-// A word whose bytes are all covered and not already split is one cell; any
-// other word is split so the bytes the access does not touch keep their own
-// state. If the arena cannot supply the split, the word cell stands in for
-// its bytes: word granularity, less precise but not unsound.
-void read_range(uintptr_t begin, size_t n, uint32_t t, bool atomic) {
-    for_each_covered_word(begin, n, [&](LineCell*, uintptr_t word, uintptr_t lo, uintptr_t hi) {
-        ByteCell* wc = word_cell_at(word);
-        bool whole = lo == word && hi == word + kWordBytes;
-        if (whole && !cell_split(wc)) {
-            read_byte(wc, word, t, atomic);
-            return;
-        }
-        ByteCell* bytes = ensure_split(wc);
-        if (bytes == nullptr) {
-            read_byte(wc, word, t, atomic);
-            return;
-        }
-        for (uintptr_t b = lo; b < hi; ++b) {
-            read_byte(&bytes[b & (kWordBytes - 1)], b, t, atomic);
-        }
-    });
-    atomic_fetch_add_u64(&g_header->read_events, n);
-}
-
-void write_range(uintptr_t begin, size_t n, uint32_t t, bool atomic) {
-    uintptr_t end = begin + static_cast<uintptr_t>(n);
-    uintptr_t a = begin;
-    while (a < end) {
-        uintptr_t line = a & ~(kLineBytes - 1);
-        uintptr_t line_end = std::min(end, line + kLineBytes);
-        LineCell* lc = line_cell_at(line);
-        if (line_is_hwcc(lc)) {
-            a = line_end;
-            continue;
-        }
-        line_lock(lc);
-        // The part of THIS line the store covers, which is the location an
-        // atomic store is at. Taken before any byte is installed, since
-        // install() overwrites what the last write recorded.
-        uint32_t off = static_cast<uint32_t>(a - line);
-        uint32_t len = static_cast<uint32_t>(line_end - a);
-        // A store covering every byte of the line leaves nothing of a stale
-        // copy to ride back out, so its line premise weakens (write_byte).
-        // One range only: four stores that together cover the line are four
-        // partial stores here, and stay under the ordinary premise.
-        bool covers_line = off == 0 && len == kLineBytes;
-        if (atomic) {
-            check_atomic_line_write(lc, a, t, off, len);
-        }
-        Epoch E = now_epoch(t);
-        while (a < line_end) {
-            uintptr_t word = a & ~(kWordBytes - 1);
-            uintptr_t hi = std::min(line_end, word + kWordBytes);
-            ByteCell* wc = word_cell_at(word);
-            bool whole = a == word && hi == word + kWordBytes;
-            if (whole && cell_split(wc)) {
-                // Every byte is checked and installed on its own cell first --
-                // a byte another thread read has a read clock only its cell
-                // holds. Only then do the eight agree again and collapse.
-                ByteCell* bytes = split_array(wc);
-                for (uint32_t i = 0; i < kWordBytes; ++i) {
-                    write_byte(&bytes[i], lc, word + i, t, E, atomic, covers_line);
-                }
-                unsplit(wc);
-                wc->wb = E;
-                if (uint32_t* pos = write_pos_at(word)) {
-                    *pos = trace_cur_pos();
-                }
-                cell_set_atomic(wc, atomic);
-            } else if (whole) {
-                write_byte(wc, lc, word, t, E, atomic, covers_line);
-            } else {
-                ByteCell* bytes = ensure_split(wc);
-                if (bytes == nullptr) {
-                    write_byte(wc, lc, word, t, E, atomic, covers_line);
-                } else {
-                    for (uintptr_t b = a; b < hi; ++b) {
-                        write_byte(&bytes[b & (kWordBytes - 1)], lc, b, t, E, atomic, covers_line);
-                    }
-                }
+    slotmap_clear(cell_pub_off(x));
+    slotmap_clear_other_machines(cell_acq_off(x), m);
+    // A_x[t] ↦ a
+    // W_x = ⊥: AllowAccess(⊥, ⊥) is not stored; init_allow_access derives it.
+    if (moved) {
+        SlotState st = slotmap_state_of(cell_acq_off(x), t);
+        if (st == kSlotNone || st == kSlotPending) {
+            if (SlotMap* a = cell_acq_get(x)) {
+                uint32_t k = epoch_clock(now); // AllowAccess(now(t), now(t))
+                slotmap_set(a, t, kSlotAllowAccess, k, k, trace_pos());
             }
-            a = hi;
         }
-        // Name the location this write went to, for the next atomic store to
-        // compare against.
-        lc->wl_off = static_cast<uint8_t>(off);
-        lc->wl_len = static_cast<uint8_t>(len > kLineBytes ? kLineBytes : len);
-        line_unlock(lc);
     }
-    atomic_fetch_add_u64(&g_header->write_events, n);
+    x->wb = now;
 }
 
-// ---- plain access rules ---------------------------------------------------------
+// ---- Load and Store on one cell (a byte, or an unsplit word); caller holds the line lock ----
 
-// Read(x,t) for every byte of the range.
-void rule_read(uintptr_t begin, size_t n, uint32_t t) {
-    read_range(begin, n, t, /*atomic=*/false);
+// Load:  W_x ⪯ C_t  ∧  load_acq_premise(x,t)  ⟹  R_x ↦ addRead(R_x, t)
+// The atomic loads (beyond the paper): W_x ⪯ C_t is discharged if the last
+// access to x was atomic too, and the AcqR premise is skipped.
+static void load_byte(ByteCell* x, uintptr_t addr, uint32_t t, bool atomic) {
+    if (!(g_report_once && cell_reported(x))) {
+        bool both_atomic = atomic && cell_atomic(x);
+        bool bad = false;
+        if (!both_atomic && !epoch_le(x->wb, t)) {
+            report_race(CSAN_RACE_DATA_RACE_WR, addr, t, x->wb);
+            bad = true;
+        }
+        if (!atomic && !load_acq_premise(x, t)) {
+            report_race(CSAN_RACE_READ_WITHOUT_BYTE_ACQUIRE, addr, t, x->wb);
+            bad = true;
+        }
+        if (bad) {
+            cell_set_reported(x);
+        }
+    }
+    trace_access("READ", addr, t);
+    add_read(x, t);
+    cell_set_atomic(x, atomic);
 }
 
-// Write(x,t) for every byte of the range, plus 𝕊_x ← 0, 𝕍_x ← ∅: a
-// plain store releases nothing and ends every release sequence at the bytes
-// it covers, on every machine.
-void rule_write(uintptr_t begin, size_t n, uint32_t t) {
-    sync_clear_range(shadow_offset(begin), shadow_offset(begin) + n); // keyed by pool offset
-    write_range(begin, n, t, /*atomic=*/false);
+// Store, for one byte x ∈ X:
+//   W_x ⪯ C_t  ∧  R_x ⪯ C_t  ∧  store_pub_premise(x,t)  ⟹  store_update(x, now(t))
+// The premise on c ∖ X is checked once per line (store_acq_premise_line).
+// The atomic stores (beyond the paper): both ⪯ premises are discharged if
+// the last access to x was atomic too.
+// `line_bad`: the premise on c ∖ X failed for this store, which marks X.
+static void store_byte(ByteCell* x, uintptr_t addr, uint32_t t, Epoch now, bool atomic,
+                       bool line_bad) {
+    if (!(g_report_once && cell_reported(x))) {
+        bool both_atomic = atomic && cell_atomic(x);
+        bool bad = line_bad;
+        if (!both_atomic && !epoch_le(x->wb, t)) {
+            report_race(CSAN_RACE_DATA_RACE_WW, addr, t, x->wb);
+            bad = true;
+        }
+        if (!both_atomic && !rd_le(x, t)) {
+            report_race(CSAN_RACE_DATA_RACE_RW, addr, t);
+            bad = true;
+        }
+        if (!store_pub_premise(x, t)) {
+            report_race(CSAN_RACE_WRITE_WITHOUT_PUBLISH, addr, t, x->wb);
+            bad = true;
+        }
+        if (bad) {
+            cell_set_reported(x);
+        }
+    }
+    trace_access("WRITE", addr, t);
+    store_update(x, t, now);
+    set_write_pos(addr, trace_pos());
+    cell_set_atomic(x, atomic);
+    cell_set_atomic_store(x, atomic);
+}
+
+// The premise on c ∖ X only gets easier while no other machine stores to c:
+// only such a store resets t's machine's entries of A_y, and a fence, flush
+// or store of t's machine only adds them. A byte t itself stored stays
+// covered: its A_y keeps an entry of t's machine with E_w ⪯ W_y ⪯ C_t (as
+// long as Store's W_y ⪯ C_t held). So a thread for which it held on c holds
+// it again until c's `ver` moves. One entry per line slot, per OS thread;
+// the tid and g_memo_gen guard reuse across hooks and forks.
+struct AcqPremiseMemo {
+    const LineCell* line;
+    uint32_t ver;
+    uint32_t tid;
+    uint32_t gen;
+};
+constexpr uint32_t kAcqPremiseMemoSlots = 64;
+static thread_local AcqPremiseMemo t_acq_premise_memo[kAcqPremiseMemoSlots];
+
+static AcqPremiseMemo& acq_premise_memo_slot(const LineCell* lc) {
+    return t_acq_premise_memo[(reinterpret_cast<uintptr_t>(lc) / sizeof(LineCell)) %
+                              kAcqPremiseMemoSlots];
+}
+
+// ∀y ∈ c ∖ X. store_acq_premise(y,t), for a store to the span: reports the
+// first byte that fails, and says whether all held. Before the update; a
+// store to the whole line has no such byte.
+static bool store_acq_premise_line(const LineSpan& sp, uint32_t t, bool atomic) {
+    const AcqPremiseMemo& m = acq_premise_memo_slot(sp.lc);
+    if (m.line == sp.lc && m.ver == sp.lc->ver && m.tid == t && m.gen == g_memo_gen) {
+        return true;
+    }
+    OutsideCell y =
+        find_cell_outside(sp, [&](const ByteCell* c) { return !store_acq_premise(c, t); });
+    if (y.cell == nullptr) {
+        return true;
+    }
+    report_race(atomic ? CSAN_RACE_ATOMIC_WRITE_WITHOUT_LINE_ACQUIRE
+                       : CSAN_RACE_WRITE_WITHOUT_LINE_ACQUIRE,
+                sp.lo, t, y.cell->wb, y.addr);
+    return false;
+}
+
+// After t's store to the line: a store from another machine moves `ver`,
+// and a premise that held is remembered for t.
+static void note_line_store(LineCell* lc, uint32_t t, bool held) {
+    uint8_t me = static_cast<uint8_t>(machine_of(t) + 1);
+    if (lc->last_mach != me) {
+        lc->last_mach = me;
+        ++lc->ver;
+    }
+    if (held) {
+        acq_premise_memo_slot(lc) = AcqPremiseMemo{lc, lc->ver, t, g_memo_gen};
+    }
+}
+
+// The cell holding byte `a`: its own if the word is split, else the word's.
+static const ByteCell* cell_at(uintptr_t a) {
+    ByteCell* wc = word_cell_at(a);
+    return cell_split(wc) ? &split_array(wc)[a & (kWordBytes - 1)] : wc;
+}
+
+// ---- Load and Store over a byte range ----
+
+// Load for each byte; `atomic` selects the atomic loads' shadow half.
+void load_range(uintptr_t begin, size_t n, uint32_t t, bool atomic) {
+    for_each_line_span(
+        begin, n,
+        [&](const LineSpan& sp) {
+            for_each_cell_read(sp, [&](ByteCell* x, uintptr_t a) { load_byte(x, a, t, atomic); });
+        },
+        [](const LineSpan&) {});
+    count_add(&g_header->counts[t].reads, n);
+}
+
+// Store per line c, on the bytes X it writes there: ∀y ∈ c ∖ X the AcqW
+// premise, then for each x ∈ X the byte premises and the update. A plain
+// store also ends release sequences (S_x ↦ 0), on hardware-coherent lines
+// too; `atomic` selects the atomic stores' shadow half, which leave S_x to
+// rules_sync.cpp.
+void store_range(uintptr_t begin, size_t n, uint32_t t, bool atomic) {
+    auto end_sequences = [&](const LineSpan& sp) {
+        for_each_word_in(sp, [&](ByteCell* wc, uintptr_t, uintptr_t lo, uintptr_t hi) {
+            end_release_sequences(wc, sp.s.offset(lo), sp.s.offset(hi));
+        });
+    };
+    for_each_line_span(
+        begin, n,
+        [&](const LineSpan& sp) {
+            // Under CSAN_REPORT_ONCE the line premise is skipped once the store's
+            // first byte was reported; skipping does not feed the memo.
+            bool skip = g_report_once && cell_reported(cell_at(sp.lo));
+            bool held = skip ? false : store_acq_premise_line(sp, t, atomic);
+            bool line_bad = !skip && !held;
+            Epoch now = now_epoch(t);
+            if (!atomic) {
+                end_sequences(sp);
+            }
+            for_each_cell_written(
+                sp,
+                [&](ByteCell* x, uintptr_t a) { store_byte(x, a, t, now, atomic, line_bad); },
+                [&](ByteCell*, uintptr_t word) { set_write_pos(word, trace_pos()); });
+            note_line_store(sp.lc, t, held);
+        },
+        [&](const LineSpan& sp) {
+            if (!atomic) {
+                line_lock(sp.lc);
+                end_sequences(sp);
+                line_unlock(sp.lc);
+            }
+        });
+    count_add(&g_header->counts[t].writes, n);
+}
+
+// ---- the plain rules ----
+
+void rule_load(uintptr_t begin, size_t n, uint32_t t) {
+    load_range(begin, n, t, /*atomic=*/false);
+}
+
+// Store, plus S_x ↦ 0: a plain store ends release sequences.
+void rule_store(uintptr_t begin, size_t n, uint32_t t) {
+    store_range(begin, n, t, /*atomic=*/false);
 }
 
 } // namespace csan

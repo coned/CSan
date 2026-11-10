@@ -1,193 +1,232 @@
 // SPDX-License-Identifier: MIT
-// WriteBack, Flush, SFence and MFence, and the four state transformations
-// they apply.
-//
-// A write-back or flush RECORDS an intermediate slot -- wb(E) or flushed(E) --
-// and the thread's next fence FINISHES it. So that a fence need not scan every
-// byte of the pool, each record is also queued in pending_queue(t), per relay kind,
-// and the fence completes exactly the slots this thread queued. This is exact:
-// a fence only finishes slots keyed by the fencing thread, all queued by it.
+// The rules Writeback, Flush, SFence and MFence, the predicates CanPub,
+// CanPubPrev and CanAcq, the steps Start, ApplyFin, ApplySFin and ApplyMFin,
+// and the queries PubB, PubPrev, AcqR and AcqW.
+// The fence rules apply their functions to every byte; an entry of t they
+// change is one Start made Pending, or ApplySFin made
+// AllowStore, so each such entry is queued in pending_queue(t) and a fence
+// visits exactly t's queues. Exact, since only t's fences change t's entries.
 #include "rules/rules.h"
 
 #include "base/atomics.h"
 #include "base/report.h"
+#include "base/trace.h"
 #include "repr/shadow.h"
 #include "repr/slotmap.h"
+#include "repr/walk.h"
 
 #include <algorithm>
 
 namespace csan {
 
-// ---- recording ---------------------------------------------------------------
+// ---- queries (formulas in rules.h) ----
 
-// recordWB / recordFlush on one map, queueing a new record for the fence.
-// `m` is null when the arena could not supply the map.
-static void record(SlotMap* m, uintptr_t addr, uint32_t t, Epoch E, PendingKind kind) {
-    if (m != nullptr && slotmap_record(m, t, E)) {
-        pending_queue(t, kind).push_back(Pending{addr, E});
-    }
+// ∃u: query_entry(q, u, ...) over the map at `off`.
+static bool query_any(Query q, uint32_t off, uint32_t t) {
+    VectorClock c = thread_vc(t);
+    return slotmap_for_each(off, [&](uint32_t u, SlotState st, Epoch E, Epoch E_r, uint32_t,
+                                     uint32_t) { return query_entry(q, u, st, E, E_r, c, t); });
 }
 
-// WB_{t,ℓ,E}(σ):
-//   ℙ^L_ℓ ← recordWB(ℙ^L_ℓ, t, E)   if mach(t) = mach(thr(W^L_ℓ))  ∧  W^L_ℓ ⊑ ℂ_t
-//   ℙ^B_x ← recordWB(ℙ^B_x, t, E)   for each x ∈ ℓ,
-//                                    if mach(t) = mach(thr(W^L_ℓ))  ∧  W^B_x ⊑ ℂ_t
-// Only the machine currently owning the dirty line can publish it; on any
-// other machine the write-back is a no-op, not an error.
-void wb_state(LineCell* lc, uintptr_t line, uint32_t t, Epoch E) {
-    if (lc->wl == kEpochBot || machine_of(epoch_tid(lc->wl)) != machine_of(t)) {
-        return;
-    }
-    if (epoch_le(lc->wl, t)) {
-        record(slotmap_get(&lc->pub), line, t, E, kPendingPubLine);
-    }
-    for_each_byte_cell(line, [&](ByteCell* x, uintptr_t addr) {
-        bool ok = x->wb != kEpochBot && epoch_le(x->wb, t);
-        if (ok) {
-            record(cell_pub_get(x), addr, t, E, kPendingPubByte);
-        }
-        if (trace_hit(addr)) {
-            trace_event("WB", addr, t, ok ? "byte publication recorded" : "nothing to publish");
-        }
-    });
+bool pub_b(const ByteCell* x, uint32_t t) {
+    return query_any(kQueryPubB, cell_pub_off(x), t);
 }
 
-// FL_{t,ℓ,E}(σ): first the possible write-back, then, in that state,
-//   𝔸^L_ℓ ← recordFlush(𝔸^L_ℓ, t, E)   if Pub^L(ℓ, ℂ_t)
-//   𝔸^B_x ← recordFlush(𝔸^B_x, t, E)   for each x ∈ ℓ, if Pub^B(x, ℂ_t)
-// A flush records an acquisition only where the producer's publication
-// already happens-before it.
-FlushResult fl_state(LineCell* lc, uintptr_t line, uint32_t t, Epoch E) {
-    FlushResult r{};
-    wb_state(lc, line, t, E);
-    if (pub_ok(lc->pub, t)) {
-        record(slotmap_get(&lc->acq), line, t, E, kPendingAcqLine);
-        r.line = true;
-    }
-    for_each_byte_cell(line, [&](ByteCell* x, uintptr_t addr) {
-        bool ok = pub_ok(cell_pub_off(x), t);
-        if (ok) {
-            record(cell_acq_get(x), addr, t, E, kPendingAcqByte);
-            r.byte = true;
-        }
-        if (trace_hit(addr)) {
-            trace_event("FLUSH", addr, t, ok ? "byte acquisition recorded"
-                                             : "no acquisition: producer's publication not in this clock");
-        }
-    });
-    return r;
+// Whether A_x holds the AllowAccess(⊥, ⊥) entry that Store sets over the
+// initial value, for a thread of mach(t). Not stored: the entry is set by the
+// first store to x, which no store of another machine has replaced yet, and
+// only such a store resets it, setting W'_x ≠ ⊥ for good. So it is present
+// exactly when W_x ≠ ⊥ ∧ W'_x = ⊥ ∧ mach(W_x) = mach(t), and since ⊥ ⪯ C_t
+// it is a witness of both AcqR and AcqW.
+static bool init_allow_access(const ByteCell* x, uint32_t t) {
+    return x->wb != kEpochBot && x->wprev == kEpochBot &&
+           machine_of(epoch_tid(x->wb)) == machine_of(t);
 }
 
-// ---- finishing ---------------------------------------------------------------
-
-static void finish_in(uint32_t off, uint32_t t, Epoch E) {
-    SlotMap* m = slotmap_at(off);
-    if (m != nullptr) {
-        slotmap_finish(m, t, E);
-    }
+bool acq_r(const ByteCell* x, uint32_t t) {
+    return init_allow_access(x, t) || query_any(kQueryAcqR, cell_acq_off(x), t);
 }
 
-// finishPub or finishAcq, as `kind` says, over every record t queued.
-//
-// A byte record names the cell it was made on. If the word has been split
-// since, ensure_split copied the record into all eight byte cells, so every
-// one of them is finished; if it was split then and has been collapsed since,
-// the Install that collapsed it emptied the maps and there is nothing left.
-static void finish_pending(uint32_t t, PendingKind kind, Epoch E) {
+bool acq_w(const ByteCell* x, uint32_t t) {
+    return init_allow_access(x, t) || query_any(kQueryAcqW, cell_acq_off(x), t);
+}
+
+bool pub_prev(const ByteCell* x, uint32_t t) {
+    return query_any(kQueryPubPrev, x->pprev, t);
+}
+
+// ---- CanPub, CanPubPrev, CanAcq and Start ----
+
+// Start: Pending(now(t)) into t's entry if it is None. `m` is null if the arena
+// is exhausted. True if the entry changed; the caller queues it for t's next
+// fence.
+static bool pend(SlotMap* m, uint32_t t, Epoch now) {
+    return m != nullptr && slotmap_pend(m, t, now, trace_pos());
+}
+
+// CanPub(x,m,C) ⟺ W ≠ ⊥ ∧ W ⪯ C ∧ mach(W) = m, for W = W_x; CanPubPrev is
+// the same for W = W'_x.
+static bool can_pub(Epoch w, uint32_t t) {
+    return w != kEpochBot && epoch_le(w, t) && machine_of(epoch_tid(w)) == machine_of(t);
+}
+
+// The publication half of Writeback and Flush:
+//   P_x[t]  ↦ Start(P_x[t], now(t))    if CanPub(x, mach(t), C_t)
+//   P'_x[t] ↦ Start(P'_x[t], now(t))   if CanPubPrev(x, mach(t), C_t)
+// Both maps of x sit behind one queue entry; a fence finishes both.
+static void pub_pend(ByteCell* x, uintptr_t addr, uint32_t t, Epoch now) {
+    bool ok = can_pub(x->wb, t);
+    bool ok_prev = can_pub(x->wprev, t);
+    bool queued = ok && pend(cell_pub_get(x), t, now);
+    queued = (ok_prev && pend(cell_pprev_get(x), t, now)) || queued;
+    if (queued) {
+        pending_queue(t, kPendingPub).push_back(Pending{addr, now});
+    }
+    trace_access("WB", addr, t, ok || ok_prev ? "publication pending" : "nothing to publish");
+}
+
+// CanAcq(x,m,C) ⟺ W_x ≠ ⊥ ∧ ((mach(W_x) ≠ m ∧ PubB(x,C)) ∨ (mach(W_x) = m ∧ PubPrev(x,C)))
+static bool can_acq(const ByteCell* x, uint32_t t) {
+    if (x->wb == kEpochBot) {
+        return false;
+    }
+    return machine_of(epoch_tid(x->wb)) != machine_of(t) ? pub_b(x, t) : pub_prev(x, t);
+}
+
+// The acquisition half of Flush:
+//   A_x[t] ↦ Start(A_x[t], now(t))   if CanAcq(x, mach(t), C_t)
+// Returns whether CanAcq held. Start changes only None, so with A_x[t] set the
+// query is skipped and t's standing acquisition is counted.
+static bool acq_pend(ByteCell* x, uintptr_t addr, uint32_t t, Epoch now) {
+    if (slotmap_state_of(cell_acq_off(x), t) != kSlotNone) {
+        trace_access("FLUSH", addr, t, "acquisition already held");
+        return true;
+    }
+    bool ok = can_acq(x, t);
+    if (ok && pend(cell_acq_get(x), t, now)) {
+        pending_queue(t, kPendingAcq).push_back(Pending{addr, now});
+    }
+    trace_access("FLUSH", addr, t,
+                 ok ? "acquisition pending"
+                    : "no acquisition: no finished publication happens before this flush");
+    return ok;
+}
+
+// ---- ApplyFin, ApplySFin, ApplyMFin ----
+
+// `fn` on t's entry of each byte in t's queue of `kind`. A word split since
+// it was queued holds the entry in each of its byte cells; one collapsed
+// since was reset by a store. `then`, if set, keeps the entries.
+static void apply_queue(uint32_t t, PendingKind kind, SlotApply fn, Epoch now,
+                        std::vector<Pending>* then = nullptr) {
     std::vector<Pending>& queue = pending_queue(t, kind);
+    bool pub = kind == kPendingPub;
+    uint32_t pos = trace_pos();
+    LineCell* held = nullptr; // one lock per run of entries on the same line
     for (const Pending& p : queue) {
         LineCell* lc = line_cell_at(p.addr);
-        line_lock(lc);
-        if (kind == kPendingPubLine) {
-            finish_in(lc->pub, t, E);
-        } else if (kind == kPendingAcqLine) {
-            finish_in(lc->acq, t, E);
-        } else {
-            bool pub = kind == kPendingPubByte;
-            ByteCell* wc = word_cell_at(p.addr);
-            if (!cell_split(wc)) {
-                finish_in(pub ? cell_pub_off(wc) : cell_acq_off(wc), t, E);
-            } else {
-                ByteCell* bytes = split_array(wc);
-                for (uint32_t i = 0; i < kWordBytes; ++i) {
-                    finish_in(pub ? cell_pub_off(&bytes[i]) : cell_acq_off(&bytes[i]), t, E);
-                }
+        if (lc != held) {
+            if (held != nullptr) {
+                line_unlock(held);
             }
+            line_lock(lc);
+            held = lc;
         }
-        line_unlock(lc);
+        for_each_cell_of_word(p.addr, [&](ByteCell* x) {
+            if (SlotMap* m = slotmap_at(pub ? cell_pub_off(x) : cell_acq_off(x))) {
+                slotmap_apply(m, t, fn, now, pos);
+            }
+            if (SlotMap* m = pub ? slotmap_at(x->pprev) : nullptr) {
+                slotmap_apply(m, t, fn, now, pos); // P'_x, where a store may have moved P_x
+            }
+        });
+    }
+    if (held != nullptr) {
+        line_unlock(held);
+    }
+    if (then != nullptr) {
+        then->insert(then->end(), queue.begin(), queue.end());
     }
     queue.clear();
 }
 
-// SF_{t,E}(σ): finishPub on every ℙ^B_x and ℙ^L_ℓ, finishAcq on every 𝔸^L_ℓ.
-// An sfence completes publication and line acquisition. It never changes
-// 𝔸^B_x: only an mfence completes the byte acquisition a later read needs.
-void sf_state(uint32_t t, Epoch E) {
-    finish_pending(t, kPendingPubByte, E);
-    finish_pending(t, kPendingPubLine, E);
-    finish_pending(t, kPendingAcqLine, E);
+// SFence's effect. The entries ApplySFin raised to AllowStore wait for t's
+// next MFence.
+void apply_sfence(uint32_t t, Epoch now) {
+    apply_queue(t, kPendingPub, kApplyFin, now);
+    apply_queue(t, kPendingAcq, kApplySFin, now, &pending_queue(t, kPendingAcqAllowStore));
 }
 
-// MF_{t,E}(σ): SF_{t,E}, and finishAcq on every 𝔸^B_x.
-void mf_state(uint32_t t, Epoch E) {
-    sf_state(t, E);
-    finish_pending(t, kPendingAcqByte, E);
+// MFence's effect.
+void apply_mfence(uint32_t t, Epoch now) {
+    apply_queue(t, kPendingPub, kApplyFin, now);
+    apply_queue(t, kPendingAcq, kApplyMFin, now);
+    apply_queue(t, kPendingAcqAllowStore, kApplyMFin, now);
 }
 
-// ---- write-back, flush and fence rules -------------------------------------------
-//
-// Each rule records its current epoch E = now(t) and THEN increments the
-// thread's clock. Flush performs its write-back step inside fl_state, not
-// through rule_writeback, so a flush ticks once.
+// ---- the rules ----
+// Each reads the pre-state, takes now(t), then advances t's clock.
 
-// Visit each line touched by [begin, begin+n), holding its lock. A hardware-
-// coherent line keeps no write-back or flush state, so it is skipped; the
-// thread's clock still ticks for the event in the caller.
+// Each line of [begin, begin+n) under its lock. Hardware-coherent lines are
+// skipped (the caller still ticks).
 template <class F>
 static void for_each_line_locked(uintptr_t begin, size_t n, F f) {
+    Shadow s = shadow_of(begin);
     uintptr_t end = begin + static_cast<uintptr_t>(n);
     for (uintptr_t line = begin & ~(kLineBytes - 1); line < end; line += kLineBytes) {
-        LineCell* lc = line_cell_at(line);
+        LineCell* lc = s.line(line);
         if (line_is_hwcc(lc)) {
             continue;
         }
         line_lock(lc);
-        f(lc, line);
+        f(s, line);
         line_unlock(lc);
     }
 }
 
-// WriteBack:  e = wb(ℓ,t),  E = now(t)   ⟹   WB_{t,ℓ,E}(σ)[ℂ_t[t] ↦ ℂ_t[t]+1]
+// Writeback:  ∀x ∈ c. P_x[t], P'_x[t] as in pub_pend
 void rule_writeback(uintptr_t begin, size_t n, uint32_t t) {
-    Epoch E = now_epoch(t);
-    for_each_line_locked(begin, n, [&](LineCell* lc, uintptr_t line) { wb_state(lc, line, t, E); });
-    tick(t);
-}
-
-// Flush:  e = fl(ℓ,t),  E = now(t)   ⟹   FL_{t,ℓ,E}(σ)[ℂ_t[t] ↦ ℂ_t[t]+1]
-uint32_t rule_flush(uintptr_t begin, size_t n, uint32_t t) {
-    Epoch E = now_epoch(t);
-    uint32_t lines = 0, bytes = 0;
-    for_each_line_locked(begin, n, [&](LineCell* lc, uintptr_t line) {
-        FlushResult r = fl_state(lc, line, t, E);
-        lines += r.line ? 1 : 0;
-        bytes += r.byte ? 1 : 0;
+    Epoch now = now_epoch(t);
+    for_each_line_locked(begin, n, [&](const Shadow& s, uintptr_t line) {
+        for_each_byte_cell(s, line, [&](ByteCell* x, uintptr_t addr) {
+            if (x->wb != kEpochBot) { // never written: W'_x = ⊥ too, nothing to publish
+                pub_pend(x, addr, t, now);
+            }
+        });
     });
     tick(t);
-    return flush_verdict(lines, bytes);
 }
 
-// SFence:  e = sf(t),  E = now(t)   ⟹   SF_{t,E}(σ)[ℂ_t[t] ↦ ℂ_t[t]+1]
+// Flush:  ∀x ∈ c. P_x[t], P'_x[t] as in Writeback, A_x[t] as in acq_pend
+// acq_pend reads the pre-state: pub_pend only makes entries Pending, which
+// PubB and PubPrev do not count, so a flush never acquires its own publication.
+uint32_t rule_flush(uintptr_t begin, size_t n, uint32_t t) {
+    Epoch now = now_epoch(t);
+    uint32_t lines = 0;
+    for_each_line_locked(begin, n, [&](const Shadow& s, uintptr_t line) {
+        bool any = false;
+        for_each_byte_cell(s, line, [&](ByteCell* x, uintptr_t addr) {
+            if (x->wb == kEpochBot) { // never written: CanPub, CanPubPrev, CanAcq all fail
+                return;
+            }
+            pub_pend(x, addr, t, now);
+            any = acq_pend(x, addr, t, now) || any;
+        });
+        lines += any ? 1 : 0;
+    });
+    tick(t);
+    return lines;
+}
+
+// SFence:  ∀x. P_x[t], P'_x[t] ↦ ApplyFin(·, now(t)),  A_x[t] ↦ ApplySFin(A_x[t], now(t))
 void rule_sfence(uint32_t t) {
-    Epoch E = now_epoch(t);
-    sf_state(t, E);
+    apply_sfence(t, now_epoch(t));
     tick(t);
 }
 
-// MFence:  e = mf(t),  E = now(t)   ⟹   MF_{t,E}(σ)[ℂ_t[t] ↦ ℂ_t[t]+1]
+// MFence:  ∀x. P_x[t], P'_x[t] ↦ ApplyFin(·, now(t)),  A_x[t] ↦ ApplyMFin(A_x[t], now(t))
 void rule_mfence(uint32_t t) {
-    Epoch E = now_epoch(t);
-    mf_state(t, E);
+    apply_mfence(t, now_epoch(t));
     tick(t);
 }
 

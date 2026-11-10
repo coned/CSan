@@ -22,17 +22,15 @@ void csan_init(uint32_t hosts, uint32_t machine, uint64_t cxl_mem_size) {
 }
 
 void csan_spawn(uint32_t hosts, uint32_t machine) {
-    // This process is a forked child. The interposed fork() left the forking
-    // thread's clock as of the fork in t_fork_clock (thread.cpp); that is the
-    // Fork edge. Without it (a child not created through our fork), the
-    // inherited t_tid's live clock is used.
+    // t_fork_clock is the parent's clock at fork (thread.cpp); if absent, fall
+    // back to the inherited t_tid.
     uint32_t parent = t_fork_parent != UINT32_MAX ? t_fork_parent : t_tid;
     std::vector<uint32_t> parent_clock = std::move(t_fork_clock);
     t_fork_clock.clear();
     t_fork_parent = UINT32_MAX;
     t_tid = UINT32_MAX;
-    // glibc can reuse a dead thread's pthread_t after fork, which would alias
-    // a new thread to an inherited tid; this machine's threads get fresh ones.
+    // glibc may reuse an inherited pthread_t, aliasing a new thread to an old
+    // tid.
     thread_ids().clear();
     g_initializer = false; // never unlink the segment from a child
     if (!g_attached) {
@@ -49,6 +47,7 @@ void csan_spawn(uint32_t hosts, uint32_t machine) {
     g_header->machine_pid[machine] = static_cast<uint32_t>(getpid());
     g_header->machine_registered[machine] = 1;
     g_machine = machine;
+    ++g_memo_gen;
     uint32_t tid = allocate_tid_locked();
     if (tid != UINT32_MAX) {
         atomic_store_u32(&g_header->machine_of_thread[tid], machine);
@@ -65,9 +64,7 @@ void csan_spawn(uint32_t hosts, uint32_t machine) {
     }
 }
 
-// Join with the machine process `pid`, which the caller has waited for: the
-// Join rule from that machine's main thread, exactly as pthread_join is a Join
-// from the joined thread.
+// Join from that machine's main thread.
 void csan_join(uint32_t pid) {
     uint32_t t = __csan_thread_id();
     if (t == UINT32_MAX) {
@@ -98,9 +95,7 @@ void __csan_init(void) {
     if (g_attached) {
         return;
     }
-    // A program that must discover its CXL region first (an allocator that
-    // maps at a fixed address, say) calls csan_init itself at the right
-    // moment and asks the pass-inserted call to stand aside.
+    // The program will call csan_init itself, e.g. after mapping its region.
     const char* defer = getenv("CSAN_DEFER_INIT");
     if (defer != nullptr && *defer != '\0' && *defer != '0') {
         return;

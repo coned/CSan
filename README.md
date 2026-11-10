@@ -128,9 +128,17 @@ Set `CSAN_WATCH_BYTES` to at least the total watched size.
 
 ## Reports
 
-Report kinds: `read-before-hb-write`, `read-without-byte-acquire`,
-`write-before-hb-line-write`, `write-after-read`, `write-without-line-acquire`,
-`atomic-write-without-line-acquire`.
+Report kinds: `data-race-wr`, `read-without-byte-acquire`,
+`data-race-rw`, `write-without-line-acquire`,
+`atomic-write-without-line-acquire`, `data-race-ww`, `write-without-publish`.
+
+A store is checked byte by byte. It needs the bytes it overwrites to have
+been written back by any other machine that wrote them (else
+`write-without-publish`), and the bytes it leaves on the line to have been
+flushed and fenced on this machine after another machine wrote them (else
+`write-without-line-acquire`). Stores to one line need no order among
+themselves. A read needs an `mfence` to have finished its flush; a store
+needs only an `sfence`.
 
 By default each finding is one line:
 
@@ -163,7 +171,8 @@ means state was dropped, so findings may be wrong. Raise the matching size flag.
 | `CSAN_SYMBOLIZER=path` | Symbolizer to run. Default `llvm-symbolizer-<major>`, then `llvm-symbolizer`. |
 | `CSAN_TRACE_RANGE=lo:hi` | Log every event in a range of pool offsets. |
 | `CSAN_TRACE_DEBUG=1` | Print the symbolizer's raw output. |
-| `CSAN_REPORT_LIMIT=n` | Findings printed before going quiet. Default 100; 0 means no limit. Later findings are still counted. |
+| `CSAN_REPORT_LIMIT=n` | Findings printed before going quiet. Default 100; 0 means no limit; `off` prints nothing and takes no lock (for timing). Later findings are still counted. |
+| `CSAN_REPORT_ONCE=0` | Check and count every finding at a byte. Default: after a byte's first finding its checks are skipped (its state is still updated), as TSan stops checking a racy word. |
 | `CSAN_DEBUG_ALLOC=1` | Print every pool allocation. |
 
 ### Memory and sizing

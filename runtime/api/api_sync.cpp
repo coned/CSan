@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: MIT
-// Synchronization events: the atomic operations the pass replaces, IR fences,
-// recognized locks, and the manual release/acquire hooks.
-//
-// Each hook decodes its flags into the rule to fire and calls it. The rules are
-// in rules_sync.cpp; the flag word is described in rawatomic.h.
+// Synchronization hooks: atomics, IR fences, locks, manual release/acquire.
+// Rules are in rules_sync.cpp; flags in rawatomic.h.
 #include "csan_runtime.h"
 #include "state/layout.h"
 #include "base/rawatomic.h"
 #include "base/report.h"
 #include "rules/rules.h"
-#include "base/spinlock.h"
 #include "base/trace.h"
 #include "state/state.h"
 #include "repr/vectorclock.h"
@@ -19,14 +15,11 @@ using namespace csan;
 namespace {
 
 uint32_t acting_thread() {
-    // A hook re-entered from a fault inside another hook's access has no
-    // thread to check against: it performs the access and records nothing.
+    // A hook re-entered from inside another hook records nothing.
     return g_attached && !inside_hook() ? __csan_thread_id() : UINT32_MAX;
 }
 
-// Whether an atomic operation also runs the shadow half: only where the
-// location has a shadow cell. Atomics are routinely used on memory outside the
-// pool -- a process-local handshake, for instance -- and those have none.
+// Only pool memory has shadow; atomics are often used outside it.
 bool shadow_for(uintptr_t a, uint32_t size) {
     return cxl_contains(a, size);
 }
@@ -35,10 +28,8 @@ bool shadow_for(uintptr_t a, uint32_t size) {
 
 extern "C" {
 
-// ---- atomic operations: load, store, read-modify-write, compare-exchange ------
-//
-// A thread with no id still performs the operation, unchecked: it has no clock
-// to record against.
+// ---- atomics ----
+// A thread with no id still performs the operation, unchecked.
 
 uint64_t __csan_atomic_load(const void* addr, uint32_t size, uint32_t flags) {
     uint32_t t = acting_thread();
@@ -81,7 +72,6 @@ uint64_t __csan_atomic_rmw(void* addr, uint64_t val, uint32_t size, uint32_t op,
     }
     uintptr_t a = reinterpret_cast<uintptr_t>(addr);
     bool shadow = shadow_for(a, size);
-    // An RMW writes, so it is recorded as the write a later report looks for.
     if (shadow) {
         trace_record(kEvWrite, a, size, t);
     }
@@ -105,7 +95,7 @@ uint64_t __csan_atomic_cas(void* addr, uint64_t expected, uint64_t desired, uint
                     (flags & kAtomicMFenced) != 0);
 }
 
-// ---- IR fences ----------------------------------------------------------------
+// ---- IR fences ----
 
 void __csan_fence_release(void) {
     uint32_t t = acting_thread();
@@ -128,7 +118,7 @@ void __csan_fence_acqrel(void) {
     }
 }
 
-// ---- locks --------------------------------------------------------------------
+// ---- locks ----
 
 void __csan_lock(const void* lock) {
     uint32_t t = acting_thread();
@@ -144,13 +134,9 @@ void __csan_unlock(const void* lock) {
     }
 }
 
-// ---- manual release / acquire -------------------------------------------------
-//
-// For call sites the pass does not replace: the caller has already performed
-// the access itself, so these apply only the clock effect of the store or load
-// half, and there is no shadow half. The store forms differ as StoreRel and
-// RmwRel do: a release STORE heads the only surviving sequence at the address,
-// a release READ-MODIFY-WRITE extends the existing ones.
+// ---- manual release / acquire ----
+// The caller did the access; these apply only its clock effect. A release
+// store replaces the sequences at the address; a release RMW extends them.
 
 void __csan_release(const void* addr) {
     uint32_t t = acting_thread();
@@ -158,12 +144,10 @@ void __csan_release(const void* addr) {
         return;
     }
     uintptr_t a = reinterpret_cast<uintptr_t>(addr);
-    spin_lock(&g_header->global_lock);
-    store_half_rel_locked(a, 1, t);
+    store_half(a, 1, t, /*release=*/true);
     if (trace_hit(a)) {
         trace_event("RELEASE", a, t, "store");
     }
-    spin_unlock(&g_header->global_lock);
     tick(t);
 }
 
@@ -173,12 +157,10 @@ void __csan_release_rmw(const void* addr) {
         return;
     }
     uintptr_t a = reinterpret_cast<uintptr_t>(addr);
-    spin_lock(&g_header->global_lock);
-    rmw_half_rel_locked(a, t);
+    rmw_half(a, t, /*release=*/true);
     if (trace_hit(a)) {
         trace_event("REL-RMW", a, t, "merged");
     }
-    spin_unlock(&g_header->global_lock);
     tick(t);
 }
 
@@ -188,12 +170,10 @@ void __csan_acquire(const void* addr) {
         return;
     }
     uintptr_t a = reinterpret_cast<uintptr_t>(addr);
-    spin_lock(&g_header->global_lock);
-    load_half_acq_locked(a, t);
+    load_half(a, t, /*acquire=*/true);
     if (trace_hit(a)) {
         trace_event("ACQUIRE", a, t, "merged");
     }
-    spin_unlock(&g_header->global_lock);
 }
 
 } // extern "C"

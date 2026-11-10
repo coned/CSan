@@ -1,19 +1,15 @@
 // SPDX-License-Identifier: MIT
-// The shape of the shared segment: its constants, the state structures it
-// holds, and the process-local pointers into it.
+// The shared segment: constants, state structures, process-local pointers.
+// A contract between processes: every one computes the same Layout and
+// refuses to attach on mismatch. Any change here means bumping kVersion.
 //
-// Every process computes the same Layout from the same environment and refuses
-// to attach if the header disagrees, so these definitions are a contract
-// between processes, not merely between translation units. Changing any of
-// them means bumping kVersion.
-//
-// Notation for the checker's state (x = a byte, l = a line, t = a thread,
-// a = a lock or atomic address):
+// Notation (x = byte, l = line, t = thread, a = lock or atomic address):
 //   C_t            thread t's vector clock; F^rel_t / F^acq_t its fence clocks
-//   W^B_x, W^L_l   the last write to byte x / to any byte of line l
+//   W_x            the last store to byte x
+//   W'_x           the last store to x from a machine other than mach(W_x)
 //   R_x            the reads of x since its last write
-//   P^B_x, P^L_l   publication maps: per thread, a write-back (then fence)
-//   A^B_x, A^L_l   acquisition maps: per thread, a flush (then fence)
+//   P_x, P'_x      publication maps of W_x, W'_x: per thread, a write-back (then fence)
+//   A_x            acquisition map: per thread, a flush (then fence), or a store
 //   L_a            the clock the last unlocker of lock a published
 //   S_x            the release-sequence clock of atomic location x
 #ifndef CSAN_LAYOUT_H
@@ -29,12 +25,11 @@
 namespace csan {
 
 constexpr uint32_t kMagic = 0x4353414Eu; // "CSAN"
-constexpr uint32_t kVersion = 11;
+constexpr uint32_t kVersion = 17 + (sizeof(Epoch) == 8 ? 0x10000 : 0); // widths never mix
 constexpr uint32_t kMaxThreads = 256; // hard cap: TID_BITS below must cover it
 constexpr uint32_t kMaxMachines = 64;
 constexpr uint32_t kMaxRanges = 4096;
-// Watched regions beyond the pool. A region is a whole mapping, not an
-// allocation inside one.
+// Watched regions beyond the pool; each is a whole mapping.
 constexpr uint32_t kMaxWatchRegions = 16;
 
 constexpr uint32_t kMaxRoots = 64;
@@ -46,15 +41,13 @@ constexpr uint32_t kInitStateUninit = 0;
 constexpr uint32_t kInitStateInitializing = 1;
 constexpr uint32_t kInitStateReady = 2;
 
-// ---- tracing (CSAN_TRACE) --------------------------------------------------
-//
-// Off by default; off costs one predicted branch per hook.
+// ---- tracing (CSAN_TRACE); off costs one predicted branch per hook ----
 constexpr uint32_t kStackFrames = 8;   // frames captured per event
 constexpr uint32_t kMaxModules = 32;   // distinct binaries a frame can name
 constexpr uint32_t kDefaultTraceDepth = 4096;      // ring entries per thread
 constexpr uint32_t kDefaultTraceStacks = 1u << 16; // interned stacks
 
-// What an Event records. The order is the order of kEventNames in trace.cpp.
+// Order must match kEventNames in trace.cpp.
 enum EventKind : uint8_t {
     kEvNone = 0,
     kEvRead,
@@ -70,123 +63,97 @@ enum EventKind : uint8_t {
     kEvKindCount,
 };
 
-// Capacity of the address-keyed L_a and S_x tables; override with
-// CSAN_CLOCK_ENTRIES. One entry per distinct lock or release-store address,
-// never reclaimed. A full table records no further happens-before and the
-// checker starts reporting false races (tests/m1_t2_cas_lock_many/).
+// L_a / S_x table capacity (CSAN_CLOCK_ENTRIES), one entry per distinct
+// address, never reclaimed. A full table loses happens-before: false races.
 constexpr uint32_t kDefaultClockEntries = 4096;
 
-// Thread slots every vector clock is sized for; override with CSAN_THREADS.
-// Each clock costs 4 bytes per slot and merge() is linear in it, so size this
-// to the run rather than to kMaxThreads.
+// Vector-clock width (CSAN_THREADS): every clock row holds this many entries.
 constexpr uint32_t kDefaultThreads = 64;
 
-// ---- SlotMap: Tid -> PSlot, or Tid -> ASlot -------------------------------
-//
-// 24 bytes.
-//
-//   off  size  field       contents
-//   ---  ----  ----------  --------------------------------------------------
-//     0    16  inline_e[4] four packed Epochs, one per entry
-//    16     4  full_off    0 = inline mode; else an arena offset
-//    20     1  inline_s    four 2-bit SlotStates, entry i in bits 2i..2i+1
-//    21     3  pad         unused; brings the struct to a 4-byte multiple so
-//                          an array of them stays naturally aligned
-//   ---  ----
-//         24
-//
-// Two modes, never a mixture:
-//
-//   full_off == 0   INLINE. Up to four entries live in inline_e[] and
-//                   inline_s. Entry i is present when its state is not
-//                   kSlotBot, and its key is epoch_tid(inline_e[i]).
-//
-//   full_off != 0   PROMOTED. An arena block of `threads` entries indexed
-//                   DIRECTLY BY TID holds the map, and inline_e/inline_s are
-//                   dead. The block is {uint8_t st[threads]; uint32_t
-//                   clk[threads];} -- see fullmap_states / fullmap_clocks.
-//                   Entry u's epoch is epoch_make(u, clk[u]). No tid is
-//                   stored: the key always equals the epoch's tid.
+// ---- SlotMap: P_x : Tid -> PubSt, or A_x : Tid -> AcqSt (40 bytes) ----
+// Inline (full_off == 0): up to four entries; entry i present when its state
+// is not kSlotNone, keyed by epoch_tid(inline_e[i]). inline_e[i] is the
+// entry's epoch E (E_w for AllowAccess); inline_m[i] the clock of E_r, read only
+// in AllowAccess.
+// Promoted (full_off != 0): an arena block indexed by tid,
+// {uint8_t st[threads]; uint32_t clk[threads]; uint32_t clk_m[threads];};
+// inline fields are dead.
 struct SlotMap {
     Epoch inline_e[4];
-    uint32_t full_off;
-    uint8_t inline_s;
+    uint32_t inline_m[4];
+    uint32_t full_off;  // 0 = inline; else arena offset of the promoted block
+    uint8_t inline_s;   // four 2-bit SlotStates, entry i in bits 2i..2i+1
     uint8_t pad[3];
 };
 
-// Trails an inline SlotMap under tracing: for slot i, the Pos of the
-// write-back or flush that recorded it and of the fence that finished it.
+// Under tracing, after an inline SlotMap: per slot, the Pos of the
+// write-back/flush that recorded it and the fence that finished it.
 struct SlotProv {
     uint32_t rec[4];
     uint32_t fin[4];
 };
 
-// ---- ByteCell -------------------------------------------------------------
-//
-// 16 bytes. One per 8-byte pool word while all eight bytes carry equal state;
-// when they diverge the word is SPLIT and eight of these live in the arena, one
-// per byte. Every ^B component is logically per byte.
-//
-//   off  size  field  contents
-//   ---  ----  -----  -------------------------------------------------------
-//     0     4  wb     W^B_x, a packed Epoch. kEpochBot = never written.
-//     4     4  rd     R_x: a packed Epoch, or a ReadList offset (see below)
-//     8     4  pub    flags + P^B_x SlotMap offset
-//    12     4  acq    flags + A^B_x SlotMap offset
-//   ---  ----
-//         16
-//
-// Arena offsets are 8-byte aligned, so bits 0..2 of `pub` and `acq` are always
-// zero and carry flags instead:
-//
-//   pub   bit 0  kRdSharedBit  `rd` is a ReadList offset, not an Epoch
-//         bit 1  kAtomicBit    atomic_x: was the last access to this byte
-//                              atomic (NOT the A^B_x relay, which is `acq`)
-//         bits 3+              offset of the P^B_x SlotMap, 0 = the empty map
-//
-//   acq   bit 0  kSplitBit     this word is SPLIT (see below)
-//         bits 3+              offset of the A^B_x SlotMap, 0 = the empty map
-//
-// R_x is the threads that have read the byte since its last write, each with
-// the clock of its latest read. It is only upserted, scanned and reset, never
-// indexed by thread, so it is stored two ways:
-//
-//   rd-shared clear  the reads are ordered by happens-before, so the last one
-//                    summarizes them: held as its packed Epoch c@t itself.
-//                    kEpochBot = no reader.
-//   rd-shared set    two concurrent reads: `rd` is the arena offset of a
-//                    ReadList holding one Epoch per reader.
-//
-// SPLIT is a representation detail. An access covering part of a word makes
-// its bytes diverge, so eight ByteCells are allocated in the arena, each a copy
-// of the word's state, and THIS cell becomes a pointer to them: kSplitBit set,
-// `rd` holding the array's offset, wb/pub/acq dead. A write covering the whole
-// word collapses it back (shadow.h).
+// ---- ByteCell (24 bytes; 40 with CSAN_EPOCH64) ----
+// One per 8-byte word while its bytes share state. When they diverge the word
+// is split: eight ByteCells in the arena, one per byte, and this cell has
+// kSplitBit set, `rd` = their offset, other fields dead. A whole-word write
+// collapses it back when its bytes then agree (shadow.h). Arena offsets are 8-aligned, so bits 0..2 of
+// pub/acq hold flags.
+// R_x is one Epoch while the reads are ordered by happens-before (the last
+// one stands for all), and a ReadList from the first concurrent read.
 struct ByteCell {
-    Epoch wb;
-    uint32_t rd;
-    uint32_t pub;
-    uint32_t acq;
+    Epoch wb;     // W_x; kEpochBot = never written
+    Epoch rd;     // R_x: the last ordered read's Epoch (kEpochBot = none), or ReadList offset
+    uint32_t pub; // flags | P_x SlotMap offset (0 = empty)
+    uint32_t acq; // flags | A_x SlotMap offset (0 = empty)
+    Epoch wprev;  // W'_x: last store to x from a machine other than mach(W_x); kEpochBot = none
+    uint32_t pprev; // P'_x SlotMap offset (0 = empty): the publications of W'_x
 };
 
-constexpr uint32_t kRdSharedBit = 1u; // ByteCell::pub bit 0
-constexpr uint32_t kAtomicBit = 2u;   // ByteCell::pub bit 1
-constexpr uint32_t kSplitBit = 1u;    // ByteCell::acq bit 0
+constexpr uint32_t kRdSharedBit = 1u; // pub bit 0: `rd` is a ReadList offset
+constexpr uint32_t kAtomicBit = 2u;   // pub bit 1: atomic_x (not the A_x relay)
+constexpr uint32_t kSyncBit = 4u;     // pub bit 2: S_x may be set here; a plain write must end it
+constexpr uint32_t kSplitBit = 1u;    // acq bit 0: word is split
+constexpr uint32_t kAtomicStoreBit = 2u; // acq bit 1: the last store to x was atomic
+constexpr uint32_t kReportedBit = 4u;    // acq bit 2: a finding was reported at x (CSAN_REPORT_ONCE)
 constexpr uint32_t kOffMask = ~7u;    // the arena-offset part of either field
 
 static inline bool cell_rd_shared(const ByteCell* c) {
     return (c->pub & kRdSharedBit) != 0;
 }
 
-// atomic_x: whether the last access to this byte was atomic. Two atomic
-// accesses to one location never race, however weak their orderings. (Not the
-// A^B_x acquisition map, which is the `acq` field.)
+// `rd` as an arena offset: a ReadList (rd-shared) or a split array (split).
+static inline uint32_t cell_rd_off(const ByteCell* c) {
+    return static_cast<uint32_t>(c->rd);
+}
+
+// atomic_x: last access was atomic. Two atomics never race, whatever the order.
 static inline bool cell_atomic(const ByteCell* c) {
     return (c->pub & kAtomicBit) != 0;
 }
 
 static inline void cell_set_atomic(ByteCell* c, bool v) {
     c->pub = v ? (c->pub | kAtomicBit) : (c->pub & ~kAtomicBit);
+}
+
+// The last store to x was atomic, so the runtime wrote it back
+// (push_atomic_write). Set by each store; a load leaves it.
+static inline bool cell_atomic_store(const ByteCell* c) {
+    return (c->acq & kAtomicStoreBit) != 0;
+}
+
+static inline void cell_set_atomic_store(ByteCell* c, bool v) {
+    c->acq = v ? (c->acq | kAtomicStoreBit) : (c->acq & ~kAtomicStoreBit);
+}
+
+// A finding was reported at x; under CSAN_REPORT_ONCE its checks are skipped
+// from then on, as TSan does for a racy word. Its state is still updated.
+static inline bool cell_reported(const ByteCell* c) {
+    return (c->acq & kReportedBit) != 0;
+}
+
+static inline void cell_set_reported(ByteCell* c) {
+    c->acq |= kReportedBit;
 }
 
 static inline bool cell_split(const ByteCell* c) {
@@ -209,65 +176,32 @@ static inline void cell_set_acq_off(ByteCell* c, uint32_t off) {
     c->acq = (c->acq & ~kOffMask) | (off & kOffMask);
 }
 
-// ---- ReadList: R_x after two concurrent reads ------------------------------
-//
-// 32 bytes, chained. One Epoch per thread that has read the byte since its
-// last write, kEpochBot in unused entries; a full block links to another.
-// Scans and upserts walk the chain, so the cost is the number of readers, not
-// the number of thread slots. Seven readers fit in one block.
-//
-//   off  size  field  contents
-//   ---  ----  -----  -------------------------------------------------------
-//     0    28  e[7]   Epochs, one per reader; kEpochBot = free entry
-//    28     4  next   offset of the next block, 0 = end of the chain
-//   ---  ----
-//         32
+// ---- ReadList: R_x after two concurrent reads (32 bytes, chained) ----
+// Cost scales with readers, not thread slots.
 constexpr uint32_t kReadListEntries = 7;
 
 struct ReadList {
-    Epoch e[kReadListEntries];
-    uint32_t next;
+    Epoch e[kReadListEntries]; // one per reader; kEpochBot = free
+    uint32_t next;             // next block offset, 0 = end
 };
 
-// ---- LineCell -------------------------------------------------------------
-//
-// 16 bytes, one per 64-byte pool line.
-//
-//   off  size  field  contents
-//   ---  ----  -----  -------------------------------------------------------
-//     0     4  wl     W^L_l, a packed Epoch: the last write to ANY byte of the
-//                     line. kEpochBot = never written.
-//     4     4  pub    P^L_l SlotMap offset in the arena, 0 = the empty map
-//     8     4  acq    A^L_l SlotMap offset, 0 = the empty map
-//    12     1  lock   spin lock guarding this line's LineCell and the eight
-//                     ByteCells of the words inside it. 0 = free, 1 = held.
-//    13     1  wl_off byte offset WITHIN the line of the last write's first
-//                     byte, and
-//    14     1  wl_len how many bytes it covered (0 = never written). Together
-//                     they name the LOCATION of the last write, which
-//                     check_atomic_line_write needs: two atomic stores to one
-//                     location are the same bytes, two to different locations
-//                     on one line are not.
-//    15     1  flags  kHwCcBit: hardware-coherent, not checked. Set at
-//                     registration, read without the line lock.
-//   ---  ----
-//         16
+// ---- LineCell (8 bytes, one per 64-byte line) ----
+// No line-level history: stores to one line are not ordered among
+// themselves, and every rule reads the bytes' own state. `ver` only lets a
+// thread know the Store premise on the line's other bytes still holds for it.
 struct LineCell {
-    Epoch wl;
-    uint32_t pub;
-    uint32_t acq;
-    uint8_t lock;
-    uint8_t wl_off;
-    uint8_t wl_len;
-    uint8_t flags;
+    uint8_t lock;      // guards this LineCell and its eight words' ByteCells
+    uint8_t flags;     // kHwCcBit
+    uint8_t last_mach; // machine of the last store to the line, plus 1; 0 = none
+    uint8_t pad;
+    uint32_t ver;      // +1 whenever a store comes from a machine other than last_mach
 };
 
-// LineCell::flags bit 0: the program declared this line hardware-coherent, so
-// none of its state is tracked. kAlign is kLineBytes, so a line never carries
-// allocations of both kinds.
+// Hardware-coherent line: not tracked. Set at registration, read without the
+// line lock. kAlign == kLineBytes, so a line never mixes both kinds.
 constexpr uint8_t kHwCcBit = 1u;
 
-// Per-line lock. LineCell::lock is one byte so the cell stays at 16.
+// A one-byte lock keeps LineCell small.
 inline void line_lock(LineCell* lc) {
     uint32_t spins = 0;
     for (;;) {
@@ -288,56 +222,37 @@ inline void line_unlock(LineCell* lc) {
     __atomic_store_n(&lc->lock, 0, __ATOMIC_RELEASE);
 }
 
-
-// ---- WatchRegion: shared memory the checker watches but does not own -------
-//
-// Every machine maps the region at its own address, so state is keyed by
-// (id, offset within the region) and never by address. Each process records its
-// own mapping address in g_watch_base[]; only the identity and the shadow index
-// are shared.
-//
-// 24 bytes.
+// ---- WatchRegion: shared memory watched but not allocated by the checker ----
+// Each machine maps it at its own address, so state is keyed by (id, offset),
+// never by address; each process keeps its own mapping in g_regions[].
 struct WatchRegion {
     uint64_t size;       // bytes, line-aligned
-    uint64_t shadow_off; // where this region starts in the unified shadow space
-    uint32_t id;         // the program's name for the region, equal on every machine
-    uint32_t in_use;     // 0 = this slot is free
+    uint64_t shadow_off; // start in the unified shadow space
+    uint32_t id;         // program's name for it, same on every machine
+    uint32_t in_use;     // 0 = free slot
 };
 
-// ---- Event: one thing a thread did, with the stack that did it -------------
-//
-// 24 bytes, in a ring per thread. `seq` counts that thread's own events and is
-// never printed; it is what tells an EventRef whose ring slot has been reused
-// (history exhausted) from one still holding the event it names.
+// ---- Event (24 bytes, a ring per thread) ----
 struct Event {
-    uint64_t addr;  // what the event is about; 0 for a bare fence
-    uint32_t stack; // interned stack id, 0 = none captured
-    uint32_t seq;   // this thread's own event counter
-    uint32_t from;  // EventRef of the release an acquire merged from, 0 = none;
-                    // for a flush, its flush_verdict()
+    uint64_t addr;  // 0 for a bare fence
+    uint32_t stack; // interned stack id, 0 = none
+    uint32_t seq;   // per-thread counter; detects an EventRef whose ring slot was reused
+    uint32_t from;  // acquire: EventRef of the release merged, 0 = none;
+                    // flush: how many of its lines took a byte acquisition
     uint8_t kind;   // EventKind
     uint8_t len;    // bytes, for an access
-    uint16_t src;   // CSAN_SRC_*: which construct, for a write-back or flush
+    uint16_t src;   // CSAN_SRC_*, for a write-back or flush
 };
 
-// What a flush recorded, kept in its event so a report can say it: how many of
-// its lines took a line acquisition (low half) and how many a byte one (high).
-inline uint32_t flush_verdict(uint32_t lines, uint32_t bytes) {
-    return ((bytes > 0xFFFFu ? 0xFFFFu : bytes) << 16) | (lines > 0xFFFFu ? 0xFFFFu : lines);
-}
-inline uint32_t flush_verdict_lines(uint32_t v) { return v & 0xFFFFu; }
-inline uint32_t flush_verdict_bytes(uint32_t v) { return v >> 16; }
-
-// A reference to one event: (tid, seq). Zero is "no event" -- seq starts at 1.
+// (tid, seq). Zero = no event; seq starts at 1.
 inline uint32_t event_ref(uint32_t tid, uint32_t seq) {
     return (tid << 24) | (seq & 0xFFFFFFu);
 }
 inline uint32_t event_ref_tid(uint32_t r) { return r >> 24; }
 inline uint32_t event_ref_seq(uint32_t r) { return r & 0xFFFFFFu; }
 
-// An interned call stack. Frames are (module index << 48) | file offset, not
-// runtime addresses: each machine has its own load bias and stacks are
-// symbolized after the fact.
+// Interned call stack. Frames are (module << 48) | file offset, not addresses:
+// each machine has its own load bias.
 struct StackEntry {
     uint64_t frame[kStackFrames];
     uint32_t hash;   // 0 = this slot is free
@@ -361,62 +276,45 @@ struct SharedRange {
     uint32_t reserved;
 };
 
-// ---- ClockEntry: one entry of the L_a table --------------------------------
-//
-// Variable length: `threads` clocks follow the header, so an array of these is
-// walked with a run-time stride (clock_entry / clock_entry_vc).
-//
-//   off  size       field     contents
-//   ---  ---------  --------  -----------------------------------------------
-//     0          8  key       the lock's key (sync_key: pool offset, or address+machine)
-//     8          4  in_use    0 = this table slot is free
-//    12          4  reserved  unused; aligns the clocks that follow
-//    16  threads*4  vc[]      L_a: the clock the last unlocker published
-//   ---  ---------
-//       16+threads*4, rounded up to 8
-struct ClockEntry {
-    uint64_t key;
-    uint32_t in_use;
-    uint32_t reserved;
-    // uint32_t vc[threads];
-};
+// ---- sync table: L_a and S_x by key ----
+// Open-addressed within each stripe; the stripe lock guards its entries and
+// the clocks they point to.
+constexpr uint32_t kSyncStripes = 256;
 
-// ---- S_x: the release-sequence clock of an atomic location -----------------
-//
-// One entry per location with a live release sequence, holding the clock at its
-// head. Not keyed by machine. `key` is a pool offset
-// inside the pool and (address, machine) outside it; see sync_key.
-//
-// 16 bytes.
-//
-//   off  size  field    contents
-//   ---  ----  -------  -----------------------------------------------------
-//     0     8  key      the location's key
-//     8     4  in_use   0 = this table slot is free
-//    12     4  s_off    arena offset of S_x, 0 = the zero clock
-//   ---  ----
-//         16
+enum SyncSlot : uint32_t { kSyncEmpty = 0, kSyncLive = 1, kSyncDead = 2 };
+
 struct SyncEntry {
     uint64_t key;
-    uint32_t in_use;
-    uint32_t s_off;
+    uint32_t state; // SyncSlot
+    uint32_t clock; // arena offset of the clock, 0 = none
+};
+
+struct alignas(64) SyncStripe {
+    SpinLock lock;
+    uint32_t seq; // odd while a writer changes the stripe (sync_join)
+    uint32_t live;
+    uint32_t dead;
 };
 
 enum ArenaClass {
     kClassSlotMap = 0, // sizeof(SlotMap)
     kClassSplit = 1,   // 8 x sizeof(ByteCell)
-    kClassVC = 2,      // threads x 4        (an S_x clock)
-    kClassFullMap = 3, // promoted SlotMap: threads states + threads clocks
+    kClassVC = 2,      // threads x 4        (an L_a or S_x clock)
+    kClassFullMap = 3, // promoted SlotMap: threads states + threads E clocks + threads E_r clocks
     kClassReadList = 4, // sizeof(ReadList): R_x after two concurrent reads
     kNumArenaClasses = 5,
 };
 
-// ---- SharedHeader: the segment's fixed-size metadata, at offset 0 ----------
-//
-// Everything variable-size follows it; see Layout. Grouped by purpose.
+struct alignas(64) ThreadCounts {
+    uint64_t reads;
+    uint64_t writes;
+    uint64_t races;                           // reports emitted
+    uint64_t race_kind[CSAN_RACE_KIND_COUNT]; // reports by CSAN_RACE_* kind
+};
+
+// ---- SharedHeader: fixed-size metadata at offset 0 ----
 struct SharedHeader {
-    // Identity. Every process recomputes the layout from the same environment
-    // and refuses to attach if these disagree.
+    // Identity: attach refuses if these disagree.
     uint32_t magic;         // kMagic, "CSAN"
     uint32_t version;       // kVersion; bump on any layout change
     uint64_t segment_size;  // total bytes of the mapping
@@ -425,8 +323,7 @@ struct SharedHeader {
     uint64_t cxl_base;      // offset of the pool within the segment
     uint64_t cxl_size;      // pool bytes
 
-    SpinLock global_lock;   // init, tid allocation, ranges, both address-keyed
-                            //   tables, reports, atomic critical sections
+    SpinLock global_lock;   // init, tid allocation, ranges, reports
     SpinLock arena_lock;    // the arena free lists and bump pointer
     uint32_t init_state;    // kInitStateUninit / Initializing / Ready
 
@@ -434,36 +331,25 @@ struct SharedHeader {
     uint32_t next_tid;                          // next global thread id to hand out
     uint32_t machine_pid[kMaxMachines];         // pid that registered each machine
     uint32_t machine_registered[kMaxMachines];  // 1 once a machine has registered
-    uint32_t machine_main_tid[kMaxMachines];    // thread id of each machine's main thread,
-                                                //   which csan_join joins with
+    uint32_t machine_main_tid[kMaxMachines];    // each machine's main thread (csan_join)
     uint32_t machine_of_thread[kMaxThreads];    // which machine owns each thread
 
-    // Pool allocator and the table of registered regions.
+    // Pool allocator and registered ranges.
     uint64_t bump;                    // next free pool offset
     uint32_t range_count;             // high-water mark in ranges[]
     uint32_t reserved1;
     SharedRange ranges[kMaxRanges];
 
-    // Shared regions the checker watches but did not allocate. Shadow for them
-    // sits above the pool's in the same flat arrays, bump-allocated out of the
-    // budget every process computed identically (CSAN_WATCH_BYTES).
+    // Watched regions: shadow above the pool's, bump-allocated from the
+    // CSAN_WATCH_BYTES budget.
     uint64_t watch_size;  // shadow bytes reserved for watched regions
     uint64_t watch_bump;  // next free shadow offset within that budget
     uint32_t watch_count; // high-water mark in watch[]
     uint32_t reserved4;
     WatchRegion watch[kMaxWatchRegions];
 
-    // The two address-keyed tables, both capped at clock_entries.
-    uint32_t lock_count;    // entries used in the L_a table
-    uint32_t release_count; // entries used in the (address, machine) S/V table
-    uint32_t clock_entries; // capacity of each
+    uint32_t clock_entries; // locations the sync table is sized for
     uint32_t reserved2;
-    // The S/V table's hash index (sync.cpp): its free list, as entry index + 1,
-    // and the live and tombstoned slot counts.
-    uint32_t sync_free_head;
-    uint32_t sync_live;
-    uint32_t sync_tombstones;
-    uint32_t reserved5;
 
     uint64_t roots[kMaxRoots]; // compatibility-layer roots, as pool offset + 1
 
@@ -474,18 +360,9 @@ struct SharedHeader {
     uint32_t reserved3;
 
     // Counters, all monotonic.
-    uint64_t read_events;   // bytes read through the checker
-    uint64_t write_events;  // bytes written
-    uint64_t race_events;   // reports emitted
 
-    // The same reports split by kind (CSAN_RACE_* in csan_runtime.h), so a
-    // test can assert WHICH rule fired and not merely that something did.
-    uint64_t race_kind[CSAN_RACE_KIND_COUNT];
-
-    // State the runtime could not store: a publication, acquisition or read
-    // record with no room, or an arena allocation that failed. Dropping one
-    // makes a later visibility query answer "no" when the truth is "yes", a
-    // FALSE report, so this must stay zero.
+    // State dropped for lack of room. Each drop can cause a false report, so
+    // this must stay zero.
     uint64_t overflow_count;
 
     uint64_t clock_table_full;   // an address-keyed table hit its capacity
@@ -495,7 +372,7 @@ struct SharedHeader {
     uint64_t split_count;        // words split to byte granularity
     uint64_t rd_shared_count;    // R_x grown from one epoch to a ReadList
 
-    // Tracing. All zero and all arrays absent from the layout when off.
+    // Tracing; all zero when off.
     uint32_t trace_on;
     uint32_t trace_depth;              // ring entries per thread
     uint32_t trace_stacks;             // slots in the intern table
@@ -507,19 +384,15 @@ struct SharedHeader {
     // The last 64 reports, as text, for __csan_report().
     uint32_t report_head;
     char report_lines[64][256];
+
+    // Per-thread byte counts, one cache line each.
+    ThreadCounts counts[kMaxThreads];
 };
 
-// ---- Layout: where each area starts, computed identically by every process --
-//
-// The segment is laid out in this order, each area 64-byte aligned:
-//
-//   [ SharedHeader ][ ByteCell[] ][ LineCell[] ][ clock planes ]
-//   [ L_a table ][ S/V table ][ arena ][ event rings ][ stacks ][ the pool ]
-//
-// "clock planes" is three `threads` x `threads` matrices -- C_t, F^rel_t,
-// F^acq_t -- then one byte per thread saying whether F^rel_t is set, since it
-// is a vector clock OR bottom. Event rings and stacks are empty without
-// CSAN_TRACE.
+// ---- Layout: area offsets, computed identically by every process ----
+//   [ SharedHeader ][ ByteCell[] ][ LineCell[] ][ clock planes ][ sync table ]
+//   [ arena ][ event rings ][ stacks ][ cell/line Pos ][ the pool ]
+// Each area 64-byte aligned; trace areas are empty without CSAN_TRACE.
 struct Layout {
     uint64_t header_size;  // SharedHeader, rounded up to kAlign
     uint64_t words;        // shadow bytes / kWordBytes: number of ByteCells
@@ -531,10 +404,10 @@ struct Layout {
     uint64_t lines_size;
     uint64_t vc_off;       // where the three clock planes start
     uint64_t vc_size;
-    uint64_t clocks_off;   // where the L_a table starts; the S/V table follows
-    uint64_t clocks_size;  // both tables together
-    uint64_t clock_stride; // bytes per ClockEntry, including its clocks
-    uint32_t clock_entries;// capacity of each table
+    uint64_t sync_off;     // the sync table: its stripes, then its entries
+    uint64_t sync_size;
+    uint32_t sync_slots;   // entries per stripe
+    uint32_t clock_entries;
     uint32_t threads;      // vector-clock width for this segment
     uint64_t arena_off;
     uint64_t arena_size;
@@ -542,10 +415,8 @@ struct Layout {
     uint64_t events_size;
     uint64_t stacks_off;   // the interned-stack table
     uint64_t stacks_size;
-    uint64_t cellpos_off;  // Pos of each word's W^B_x; 0 when tracing is off
+    uint64_t cellpos_off;  // Pos of each word's W_x; 0 when tracing is off
     uint64_t cellpos_size;
-    uint64_t linepos_off;  // Pos of each line's W^L_l; 0 when tracing is off
-    uint64_t linepos_size;
     uint32_t trace_depth;  // ring entries per thread, 0 when tracing is off
     uint32_t trace_stacks; // slots in the intern table
     uint64_t pool_off;     // where the CXL pool itself starts
@@ -556,11 +427,10 @@ inline uint64_t align_up(uint64_t v, uint64_t a) {
     return (v + a - 1) & ~(a - 1);
 }
 
-// Slots in the S/V table's open-addressed index: a power of two, at least
-// twice the table, so a probe stays short.
-inline uint64_t sync_index_slots(uint32_t clock_entries) {
-    uint64_t n = 64;
-    while (n < 2ull * clock_entries) {
+// Power of two, twice the stripe's share of clock_entries: short probes.
+inline uint32_t sync_stripe_slots(uint32_t clock_entries) {
+    uint32_t n = 16;
+    while (static_cast<uint64_t>(n) * kSyncStripes < 2ull * clock_entries) {
         n <<= 1;
     }
     return n;
@@ -572,9 +442,7 @@ inline Layout compute_layout(uint64_t cxl_size, uint32_t clock_entries, uint32_t
     Layout lay{};
     lay.header_size = align_up(sizeof(SharedHeader), kAlign);
     lay.threads = threads;
-    // Shadow covers the pool then the watched-region budget, so a pool address
-    // indexes at its own offset and a watched region starts at cxl_size. The
-    // pool itself is only cxl_size; watched memory is mapped by the program.
+    // Shadow covers the pool, then watched regions from offset cxl_size.
     lay.watch_size = watch_size;
     uint64_t shadow_bytes = cxl_size + watch_size;
     lay.words = shadow_bytes / kWordBytes;
@@ -584,19 +452,15 @@ inline Layout compute_layout(uint64_t cxl_size, uint32_t clock_entries, uint32_t
     lay.lines_off = lay.cells_off + lay.cells_size;
     lay.lines_size = align_up(lay.lines * sizeof(LineCell), kAlign);
     lay.vc_off = lay.lines_off + lay.lines_size;
-    // Three planes of `threads` rows: C_t, F^rel_t, F^acq_t; then one byte per
-    // thread recording whether F^rel_t is set (it may be bottom).
+    // C_t, F^rel_t, F^acq_t planes, then a per-thread "F^rel_t set" byte.
     lay.vc_size = align_up(3ull * threads * threads * sizeof(uint32_t) + threads, kAlign);
     lay.clock_entries = clock_entries;
-    lay.clock_stride = align_up(sizeof(ClockEntry) + static_cast<uint64_t>(threads) * 4, 8);
-    lay.clocks_off = lay.vc_off + lay.vc_size;
-    // One address-keyed clock table (L_a) plus the (addr, machine) sync table.
-    // Then the S/V table's hash index: sync_index_slots(clock_entries) slots.
-    lay.clocks_size = align_up(static_cast<uint64_t>(clock_entries) * lay.clock_stride +
-                                   static_cast<uint64_t>(clock_entries) * sizeof(SyncEntry) +
-                                   sync_index_slots(clock_entries) * sizeof(uint32_t),
-                               kAlign);
-    lay.arena_off = lay.clocks_off + lay.clocks_size;
+    lay.sync_slots = sync_stripe_slots(clock_entries);
+    lay.sync_off = lay.vc_off + lay.vc_size;
+    lay.sync_size = align_up(kSyncStripes * (sizeof(SyncStripe) +
+                                             static_cast<uint64_t>(lay.sync_slots) * sizeof(SyncEntry)),
+                             kAlign);
+    lay.arena_off = lay.sync_off + lay.sync_size;
     lay.arena_size = align_up(arena_size, kAlign);
     lay.trace_depth = trace_depth;
     lay.trace_stacks = trace_stacks;
@@ -604,24 +468,17 @@ inline Layout compute_layout(uint64_t cxl_size, uint32_t clock_entries, uint32_t
     lay.events_size = align_up(static_cast<uint64_t>(threads) * trace_depth * sizeof(Event), kAlign);
     lay.stacks_off = lay.events_off + lay.events_size;
     lay.stacks_size = align_up(static_cast<uint64_t>(trace_stacks) * sizeof(StackEntry), kAlign);
-    // Positions ride beside the cells only under tracing.
     uint64_t pos_words = trace_depth != 0 ? lay.words : 0;
-    uint64_t pos_lines = trace_depth != 0 ? lay.lines : 0;
     lay.cellpos_off = lay.stacks_off + lay.stacks_size;
     lay.cellpos_size = align_up(pos_words * sizeof(uint32_t), kAlign);
-    lay.linepos_off = lay.cellpos_off + lay.cellpos_size;
-    lay.linepos_size = align_up(pos_lines * sizeof(uint32_t), kAlign);
-    lay.pool_off = lay.linepos_off + lay.linepos_size;
+    lay.pool_off = lay.cellpos_off + lay.cellpos_size;
     lay.total = lay.pool_off + cxl_size;
     return lay;
 }
 
 static_assert(kMaxThreads <= (1u << kTidBits), "tid field too narrow");
 
-// ---- process-local pointers into the mapping --------------------------------
-//
-// Set once by attach_shared_segment. Defined in globals.cpp.
-
+// ---- process-local pointers into the mapping, set by attach_shared_segment ----
 extern SharedHeader* g_header;
 extern uint8_t* g_segment;
 extern uint8_t* g_pool;       // the CXL pool itself
@@ -629,115 +486,110 @@ extern Event* g_events;       // per-thread rings: g_events[tid * g_trace_depth 
 extern StackEntry* g_stacks;  // the interned-stack table
 extern uint32_t g_trace_depth;   // ring entries per thread, 0 = tracing off
 extern uint32_t g_trace_stacks;  // slots in the intern table
-// This process's own mapping address for each watched region, indexed as
-// g_header->watch[] is. Process-local by nature: the whole point of a watched
-// region is that the address differs per machine. 0 = this process has not
-// mapped that region.
-extern uintptr_t g_watch_base[kMaxWatchRegions];
 extern ByteCell* g_cells;     // one per 8-byte pool word
 extern LineCell* g_lines;     // one per 64-byte pool line
-// Provenance: which code put the state there. A Pos is an interned stack id
-// (0 = none), kept only under tracing (g_prov), beside the state it explains:
-// g_cell_pos/g_line_pos for W^B_x/W^L_l, and a trailing block in each slot
-// map and split array (repr/slotmap.h, repr/shadow.h).
+// Provenance (tracing only): a Pos is an interned stack id, 0 = none, kept
+// beside W_x here and after each slot map and split array.
 extern bool g_prov;
 extern uint32_t* g_cell_pos;  // one per 8-byte pool word, while the word is unsplit
-extern uint32_t* g_line_pos;  // one per 64-byte pool line
 extern uint32_t* g_vc;        // C_t      : g_vc[tid * g_threads + other]
 extern uint32_t* g_frel;      // F^rel_t  : same shape
 extern uint32_t* g_facq;      // F^acq_t  : same shape
 extern uint8_t* g_frel_set;   // whether F^rel_t is set, one byte per thread
-extern uint8_t* g_lock_clocks;// the L_a table, walked with g_clock_stride
-extern SyncEntry* g_sync;     // the (address, machine) S/V table
-extern uint32_t* g_sync_index; // its hash index: entry index + 1, 0 empty
-extern uint64_t g_sync_index_mask;
+extern SyncStripe* g_sync_stripes;
+extern SyncEntry* g_sync;     // stripe i owns g_sync[i * g_sync_slots, (i + 1) * g_sync_slots)
+extern uint32_t g_sync_slots;
 extern uint8_t* g_arena;      // variable-size shadow state
 extern uint32_t g_threads;    // vector-clock width for this segment
-extern uint64_t g_clock_stride;
 extern uint32_t g_machine;    // this process's machine id
+extern uint32_t g_memo_gen;   // bumped when this process binds a machine: drops the Store premise memo
 extern bool g_attached;
 
-// ---- views on the mapping ---------------------------------------------------
-//
-// All of these are meaningless before attach_shared_segment has run.
+// ---- address -> shadow; process-local, so a lookup never reads the segment ----
+struct Region {
+    uintptr_t lo;
+    uintptr_t hi;  // lo == hi: not mapped here
+    uint64_t bias; // shadow index = address + bias
+};
 
-inline bool pool_contains(uintptr_t a, size_t n) {
-    if (g_pool == nullptr) {
-        return false;
-    }
-    uintptr_t base = reinterpret_cast<uintptr_t>(g_pool);
-    uintptr_t end = base + g_header->cxl_size;
-    return a >= base && a + static_cast<uintptr_t>(n) <= end;
-}
+constexpr uint32_t kMaxRegions = 1 + kMaxWatchRegions; // [0] the pool, [1 + i] watch[i]
+extern Region g_regions[kMaxRegions];
+extern uint32_t g_region_count;
 
-// The watched region containing [a, a+n), or kMaxWatchRegions for none. The
-// slow path behind region_resolve, reached only on a cache miss.
-inline uint32_t watch_index(uintptr_t a, size_t n) {
-    for (uint32_t i = 0; i < g_header->watch_count; ++i) {
-        const WatchRegion& w = g_header->watch[i];
-        uintptr_t base = g_watch_base[i];
-        if (w.in_use && base != 0 && a >= base &&
-            a + static_cast<uintptr_t>(n) <= base + w.size) {
-            return i;
+inline const Region* region_of(uintptr_t a) {
+    uint32_t n = __atomic_load_n(&g_region_count, __ATOMIC_ACQUIRE);
+    for (uint32_t i = 0; i < n; ++i) {
+        const Region& r = g_regions[i];
+        if (a - r.lo < r.hi - r.lo) {
+            return &r;
         }
     }
-    return kMaxWatchRegions;
+    return nullptr;
 }
 
-// ---- resolving an address to its region -------------------------------------
-//
-// The pool is one region and each watched mapping is another, so an address is
-// placed before its shadow index is known. One cache entry per thread holds the
-// last region resolved; a hit is one range check and one addition.
-//
-// Thread-local, not global: the words must be read together, and a torn read
-// across another thread's update would pair one region's bounds with another's
-// shadow index.
-extern thread_local uintptr_t t_region_lo;
-extern thread_local uintptr_t t_region_hi;
-extern thread_local uint64_t t_region_bias; // shadow index = addr + bias
-extern thread_local uint32_t t_region_gen;
-
-// Bumped by csan_watch, invalidating every cache entry in this process. A
-// forked child inherits the parent's cached bounds and must not keep using them
-// once it maps the region for itself.
-extern uint32_t g_region_gen;
-
-// Point this thread's cache at the region containing `a`. False, and the cache
-// left as it was, when `a` is in none. Defined in globals.cpp.
-bool region_resolve(uintptr_t a);
-
-// Is this CXL memory the checker tracks -- its own pool, or a watched region?
+// Is [a, a+n) CXL memory the checker tracks?
 inline bool cxl_contains(uintptr_t a, size_t n) {
-    if (t_region_gen == g_region_gen && a >= t_region_lo &&
-        a + static_cast<uintptr_t>(n) <= t_region_hi) {
-        return true;
-    }
-    return region_resolve(a) && a + static_cast<uintptr_t>(n) <= t_region_hi;
+    const Region* r = region_of(a);
+    return r != nullptr && a + n <= r->hi;
 }
 
-// Where this address lives in the flat shadow space: the pool occupies
-// [0, cxl_size), each watched region follows at its own shadow_off. Defined
-// only where cxl_contains holds.
-inline uint64_t shadow_offset(uintptr_t a) {
-    if (t_region_gen == g_region_gen && a >= t_region_lo && a < t_region_hi) {
-        return a + t_region_bias;
+// One region's shadow, resolved once so a range walk indexes cells directly.
+struct Shadow {
+    uint64_t bias;
+
+    uint64_t offset(uintptr_t a) const {
+        return a + bias;
     }
-    return region_resolve(a) ? a + t_region_bias : 0;
+    ByteCell* cell(uintptr_t a) const {
+        return &g_cells[offset(a) / kWordBytes];
+    }
+    LineCell* line(uintptr_t a) const {
+        return &g_lines[offset(a) / kLineBytes];
+    }
+};
+
+// Defined only where cxl_contains holds.
+inline Shadow shadow_of(uintptr_t a) {
+    return Shadow{region_of(a)->bias};
+}
+
+inline uint64_t shadow_offset(uintptr_t a) {
+    const Region* r = region_of(a);
+    return r != nullptr ? a + r->bias : 0;
 }
 
 inline ByteCell* word_cell_at(uintptr_t a) {
-    return &g_cells[shadow_offset(a) / kWordBytes];
+    return shadow_of(a).cell(a);
 }
 
 inline LineCell* line_cell_at(uintptr_t a) {
-    return &g_lines[shadow_offset(a) / kLineBytes];
+    return shadow_of(a).line(a);
 }
 
-// Hardware-coherent, and so not checked. Read without the line lock: the flag
-// is set at registration, before the memory is in use, and never changes.
+// No line lock needed: set at registration, before use, and never changes.
 inline bool line_is_hwcc(const LineCell* lc) {
     return (__atomic_load_n(&lc->flags, __ATOMIC_RELAXED) & kHwCcBit) != 0;
+}
+
+// Single writer per counter, so no atomic RMW needed.
+inline void count_add(uint64_t* c, uint64_t n) {
+    __atomic_store_n(c, __atomic_load_n(c, __ATOMIC_RELAXED) + n, __ATOMIC_RELAXED);
+}
+
+inline uint64_t count_total(uint64_t ThreadCounts::*field) {
+    uint64_t sum = 0;
+    for (const ThreadCounts& c : g_header->counts) {
+        sum += __atomic_load_n(&(c.*field), __ATOMIC_RELAXED);
+    }
+    return sum;
+}
+
+inline uint64_t race_kind_total(uint32_t kind) {
+    uint64_t sum = 0;
+    for (const ThreadCounts& c : g_header->counts) {
+        sum += __atomic_load_n(&c.race_kind[kind], __ATOMIC_RELAXED);
+    }
+    return sum;
 }
 
 inline uint32_t machine_of(uint32_t tid) {
@@ -746,7 +598,6 @@ inline uint32_t machine_of(uint32_t tid) {
     }
     return atomic_load_u32(&g_header->machine_of_thread[tid]);
 }
-
 
 } // namespace csan
 

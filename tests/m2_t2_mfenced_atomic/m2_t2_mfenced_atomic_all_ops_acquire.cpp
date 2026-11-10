@@ -71,6 +71,7 @@ int main() {
         ctx.lines[64 * i] = 1;
         _mm_clwb(ctx.lines + 64 * i);
     }
+    _mm_clwb(ctx.a); // its constructor's plain store, which machine 1 overwrites
     _mm_sfence(); // publishes all eight lines
 
     pid_t child = csan_test_spawn_machine(kHosts, 1, &writer, &ctx);

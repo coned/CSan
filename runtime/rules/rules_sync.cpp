@@ -1,198 +1,137 @@
 // SPDX-License-Identifier: MIT
-// The synchronization rules: atomic loads, stores, read-modify-writes and
-// compare-exchange, IR fences, and locks, fork and join.
+// Synchronization rules: atomics, IR fences, locks, fork and join.
 //
-// An atomic operation records its clock effect under the global lock and
-// performs the access itself OUTSIDE that critical section, ordered so that no
-// thread can observe the value without also observing the clock: a clock a
-// value publishes is recorded BEFORE the value (StoreRel/StoreRlx, the write
-// half of an Rmw), and a clock a value consumes is joined AFTER it
-// (LoadAcq/LoadRlx, the read half of an Rmw).
-//
-// The access must not happen under the lock: a program that demand-maps its
-// CXL memory from a SIGSEGV handler would fault inside it and deadlock. A
-// releasing compare-exchange cannot be split this way and takes t_hook_depth
-// instead (state.h).
-//
-// 𝕊_x crosses machines. The visibility premises do not apply to an atomic
-// access, but still apply to every plain access, including one to a byte an
-// atomic wrote.
+// Clock effects run under the location's stripe lock; the access runs outside
+// it (a SIGSEGV handler that demand-maps CXL memory would deadlock inside).
+// Published clocks are recorded before the value, consumed ones joined after.
+// A releasing CAS can't be split and uses t_hook_depth instead (state.h).
+// C_t, F^rel_t, F^acq_t have one writer, t, so need no lock.
 #include "rules/rules.h"
 
-#include "base/atomics.h"
 #include "base/rawatomic.h"
-#include "base/report.h"
-#include "base/spinlock.h"
+#include "repr/shadow.h"
 #include "repr/sync.h"
 
+#include <algorithm>
 #include <immintrin.h>
 
 namespace csan {
 
-// A real clwb + sfence so an atomic store reaches CXL memory when 𝕊_x records
-// it. Not an event: it never counts as the publication half of any chain.
+// Real clwb + sfence so the store reaches CXL memory. Not an event: never
+// counts toward publication.
 static void push_atomic_write(const void* addr) {
     if (!cxl_contains(reinterpret_cast<uintptr_t>(addr), 1)) {
-        return; // not CXL memory: the hardware handles it
+        return;
     }
     _mm_clwb(const_cast<void*>(addr));
     _mm_sfence();
 }
 
-// The MFence effect an MFENCED atomic carries: MF_{t,E} on this thread's
-// relays. MFenced means the x86 lowering is a full barrier -- every
-// read-modify-write at every ordering, and a seq_cst store.
-//
-// Runs BEFORE the rule's shadow half and at the epoch before any tick it takes,
-// so the records it finishes are ordered ahead of the access.
-//
-// Takes no lock of its own but does take line locks, so the caller must NOT
-// hold the global lock.
+// The MFence effect, for an atomic lowered to a full barrier. Takes line locks.
 static void mfence_effect(uint32_t t, bool mfenced) {
     if (mfenced) {
-        mf_state(t, now_epoch(t));
+        apply_mfence(t, now_epoch(t));
     }
 }
 
-// The key of location a in the 𝕊_x and 𝕃_a tables. A location inside the
-// pool is shared CXL memory, so its key is its pool OFFSET -- exec'd machines
-// map the pool at different addresses. A location outside the pool is
-// process-private memory that fork can place at the same address in every
-// machine, so the machine id is folded in: two machines' unrelated mutexes at
-// one address must not exchange clocks. Bit 63 separates the two kinds.
+// CXL: the shadow offset (machines map it at different addresses). Elsewhere
+// two machines' objects can share an address, so fold in the machine; bit 63
+// separates the two kinds.
 static uint64_t sync_key(uintptr_t a, uint32_t t) {
     if (cxl_contains(a, 1)) {
         return shadow_offset(a);
     }
-    return (1ull << 63) | (static_cast<uint64_t>(a) ^ ((static_cast<uint64_t>(machine_of(t)) + 1) << 48));
+    return (1ull << 63) |
+           (static_cast<uint64_t>(a) ^ ((static_cast<uint64_t>(machine_of(t)) + 1) << 48));
 }
 
-// ---- the load and store halves ---------------------------------------------------
-//
-// 𝕊_x is one clock per location: the clock at the head of the release sequence
-// currently live there. Only a read-modify-write continues a sequence (C++20);
-// any other store ends it.
-
-// LoadAcq's clock effect: ℂ_t ← ℂ_t ⊔ 𝕊_x. A release on another machine is
-// joined like any other: 𝕊_x is not partitioned by machine.
-void load_half_acq_locked(uintptr_t x, uint32_t t) {
-    thread_vc(t).merge(sync_s(sync_key(x, t)));
-}
-
-// LoadRlx's clock effect: 𝔽^acq_t ← 𝔽^acq_t ⊔ 𝕊_x, staged for a later acquire fence.
-void load_half_rlx_locked(uintptr_t x, uint32_t t) {
-    facq_vc(t).merge(sync_s(sync_key(x, t)));
-}
-
-// StoreRel's clock effect: 𝕊_x ← ℂ_t. The store heads a new release sequence,
-// so whatever was live at x is gone.
-void store_half_rel_locked(uintptr_t x, size_t size, uint32_t t) {
+// Flags the cell first so a later plain write ends the sequence.
+static uint64_t release_key(uintptr_t x, uint32_t t) {
     uint64_t k = sync_key(x, t);
-    for (uint64_t i = 1; i < size; ++i) {
-        sync_s_clear(k + i); // the other bytes it covers carry nothing
+    if (cxl_contains(x, 1)) {
+        mark_release_site(k);
     }
-    sync_s_set(k, thread_vc(t));
+    return k;
 }
 
-// StoreRlx's clock effect: 𝕊_x ← 𝔽^rel_t if a release fence is staged --
-// fence-release plus a relaxed store IS a release operation and heads a
-// sequence -- and 𝕊_x ← 0 otherwise, since a plain store ends the sequence
-// even when the storing thread is the one that began it. Returns whether the
-// store released something, which is when the thread's clock must advance.
-bool store_half_rlx_locked(uintptr_t x, size_t size, uint32_t t) {
-    uint64_t k = sync_key(x, t);
-    for (uint64_t i = 1; i < size; ++i) {
-        sync_s_clear(k + i);
+// F^rel_t if a release fence is staged, else the zero clock.
+static VectorClock staged_release(uint32_t t) {
+    return frel_is_set(t) ? frel_vc(t) : VectorClock();
+}
+
+// ---- load and store halves ----
+// S_x: the release sequence head's clock. Only an RMW continues a sequence.
+
+// LoadAcq: C_t ⊔= S_x.  LoadRlx: F^acq_t ⊔= S_x, for a later acquire fence.
+void load_half(uintptr_t x, uint32_t t, bool acquire) {
+    sync_join(sync_key(x, t), acquire ? thread_vc(t) : facq_vc(t));
+}
+
+// StoreRel: S_x <- C_t.  StoreRlx: S_x <- F^rel_t, or 0 with no fence staged.
+// Other covered bytes carry no sequence. True when it released.
+bool store_half(uintptr_t x, size_t size, uint32_t t, bool release) {
+    VectorClock c = release ? thread_vc(t) : staged_release(t);
+    uint64_t k = c.valid() ? release_key(x, t) : sync_key(x, t);
+    uint64_t word_end = (k / kWordBytes + 1) * kWordBytes;
+    for (uint64_t i = word_end; i < k + size; ++i) {
+        SyncRef(i).erase(); // unaligned: bytes in the next word
     }
-    if (!frel_is_set(t)) {
-        sync_s_clear(k);
+    SyncRef s(k);
+    for (uint64_t i = k + 1; i < std::min(k + size, word_end); ++i) {
+        s.erase_byte(i);
+    }
+    if (!c.valid()) {
+        s.erase();
         return false;
     }
-    sync_s_set(k, frel_vc(t));
+    s.clock_or_add().copy_from(c);
     return true;
 }
 
-// The read-modify-write store halves. A read-modify-write CONTINUES the release
-// sequence at x rather than ending it, so 𝕊_x is never cleared here.
-//
-// A RELEASING one also heads a sequence of its own, so it JOINS its clock into
-// 𝕊_x: an acquire reading its value synchronizes with it, and through the
-// sequence with the release before it.
-void rmw_half_rel_locked(uintptr_t x, uint32_t t) {
-    sync_s_merge(sync_key(x, t), thread_vc(t));
-}
-
-// A relaxed read-modify-write publishes only what a staged release fence
-// captured: fence-release then a relaxed RMW is a release operation.
-bool rmw_half_rlx_locked(uintptr_t x, uint32_t t) {
-    if (!frel_is_set(t)) {
+// RmwRel: S_x ⊔= C_t.  RmwRlx: S_x ⊔= F^rel_t. True when it released.
+bool rmw_half(uintptr_t x, uint32_t t, bool release) {
+    VectorClock c = release ? thread_vc(t) : staged_release(t);
+    if (!c.valid()) {
         return false;
     }
-    sync_s_merge(sync_key(x, t), frel_vc(t));
+    SyncRef(release_key(x, t)).clock_or_add().merge(c);
     return true;
 }
 
-// ---- atomic loads ----------------------------------------------------------------
-//
-// The premise -- atomic_x = ⊤ ∨ W^B_x ⊑ 𝔻 -- and ReadVis are checked by the
-// shadow half AFTER the join, as the rules state them in terms of 𝔻. A load
-// never advances ℂ_t[t].
+// ---- atomic loads ----
 
+// LoadRlx / LoadAcq; shadow: R_x[t] <- C_t[t], atomic_x <- ⊤.
+// Value first, then join, so the join covers the value's release.
 static uint64_t atomic_load(const void* addr, uint32_t size, uint32_t t, bool acquire,
                             bool shadow) {
     uintptr_t x = reinterpret_cast<uintptr_t>(addr);
-    // The value first, the join after it: 𝕊_x read here is the one live at or
-    // after the moment the value was read, so it covers whatever release this
-    // load could have observed. Joining first could take a release whose value
-    // this load did not read, which is an edge that does not exist.
     uint64_t v = raw_atomic_load(addr, size);
-    spin_lock(&g_header->global_lock);
-    if (acquire) {
-        load_half_acq_locked(x, t);
-    } else {
-        load_half_rlx_locked(x, t);
-    }
-    spin_unlock(&g_header->global_lock);
+    load_half(x, t, acquire);
     if (shadow) {
-        read_range(x, size, t, /*atomic=*/true);
+        load_range(x, size, t, /*atomic=*/true);
     }
     return v;
 }
 
-// LoadRlx:  𝔽^acq_t ← 𝔽^acq_t ⊔ 𝕊_x;  ℝ_x[t] ← ℂ_t[t];  atomic_x ← ⊤
 uint64_t rule_load_rlx(const void* addr, uint32_t size, uint32_t t, bool shadow) {
     return atomic_load(addr, size, t, /*acquire=*/false, shadow);
 }
 
-// LoadAcq:  𝔻 = ℂ_t ⊔ 𝕊_x;  ℂ_t ← 𝔻;  ℝ_x[t] ← 𝔻[t];  atomic_x ← ⊤
 uint64_t rule_load_acq(const void* addr, uint32_t size, uint32_t t, bool shadow) {
     return atomic_load(addr, size, t, /*acquire=*/true, shadow);
 }
 
-// ---- atomic stores ---------------------------------------------------------------
-//
-// Install first, then the clock effect, then the value -- all before another
-// thread can observe it. Install is what resets the relays and the read clock;
-// the store half is what ends the old release sequences.
+// ---- atomic stores ----
 
+// Install, clock, then value: whoever sees the value sees S_x already set.
 static void atomic_store(void* addr, uint64_t val, uint32_t size, uint32_t t, bool release,
                          bool shadow, bool mfenced) {
     uintptr_t x = reinterpret_cast<uintptr_t>(addr);
     mfence_effect(t, mfenced);
     if (shadow) {
-        write_range(x, size, t, /*atomic=*/true);
+        store_range(x, size, t, /*atomic=*/true);
     }
-    spin_lock(&g_header->global_lock);
-    bool released;
-    if (release) {
-        store_half_rel_locked(x, size, t);
-        released = true;
-    } else {
-        released = store_half_rlx_locked(x, size, t);
-    }
-    spin_unlock(&g_header->global_lock);
-    // The clock first, the value after it: a thread that observes this value
-    // observes a 𝕊_x that already holds what the store released.
+    bool released = store_half(x, size, t, release);
     raw_atomic_store(addr, val, size);
     push_atomic_write(addr);
     if (released) {
@@ -200,213 +139,128 @@ static void atomic_store(void* addr, uint64_t val, uint32_t size, uint32_t t, bo
     }
 }
 
-// StoreRlx:  Install_{x,now(t)};  𝕊_x ← 𝕍_x(t) ⊔ 𝔽^rel_t;  𝕍_x ← ∅[t ↦ 𝕍_x(t)];
-//            atomic_x ← ⊤;  ℂ_t[t] ← ℂ_t[t] + (𝔽^rel_t ≠ ⊥ ? 1 : 0)
+// A relaxed store is a plain `mov`: never MFenced.
 void rule_store_rlx(void* addr, uint64_t val, uint32_t size, uint32_t t, bool shadow) {
-    // A relaxed or release store is a plain `mov` on x86 and is never MFenced;
-    // the seq_cst store that IS reaches rule_store_rel, since it also releases.
     atomic_store(addr, val, size, t, /*release=*/false, shadow, /*mfenced=*/false);
 }
 
-// StoreRel:  Install_{x,now(t)};  𝕊_x ← ℂ_t;  𝕍_x ← ∅[t ↦ ℂ_t];  atomic_x ← ⊤;  ℂ_t[t] ← ℂ_t[t]+1
 void rule_store_rel(void* addr, uint64_t val, uint32_t size, uint32_t t, bool shadow,
                     bool mfenced) {
     atomic_store(addr, val, size, t, /*release=*/true, shadow, mfenced);
 }
 
-// ---- read-modify-write and compare-exchange -----------------------------------
-//
-// A read-modify-write is the atomic load behaviour followed by the atomic
-// store behaviour: the read half decides whether 𝕊_x is joined into ℂ_t or
-// staged in 𝔽^acq_t, the write half whether 𝕊_x and 𝕍_x are extended.
+// ---- read-modify-write and compare-exchange ----
 
-struct RmwOutcome {
-    bool released; // the write half released: the clock must advance
-};
-
-static RmwOutcome rmw_halves_locked(uintptr_t x, uint32_t t, bool acquire, bool release,
-                                    bool wrote) {
-    RmwOutcome o{false};
-    if (acquire) {
-        load_half_acq_locked(x, t);
-    } else {
-        load_half_rlx_locked(x, t);
-    }
-    if (wrote) {
-        if (release) {
-            rmw_half_rel_locked(x, t);
-            o.released = true;
-        } else {
-            o.released = rmw_half_rlx_locked(x, t);
-        }
-    }
-    return o;
-}
-
-// Everything after the critical section: the shadow half (read, and if the
-// operation wrote, the write with its Install), and the tick.
-static void rmw_finish(uintptr_t x, uint32_t size, uint32_t t, RmwOutcome o, bool wrote,
+static void rmw_finish(uintptr_t x, uint32_t size, uint32_t t, bool released, bool wrote,
                        bool shadow) {
     if (shadow) {
-        read_range(x, size, t, /*atomic=*/true);
+        load_range(x, size, t, /*atomic=*/true);
         if (wrote) {
-            write_range(x, size, t, /*atomic=*/true);
+            store_range(x, size, t, /*atomic=*/true);
         }
     }
-    if (o.released) {
+    if (released) {
         tick(t);
     }
 }
 
-// RmwRlx:     Install;  𝔽^acq_t ⊔= 𝕊_x;  𝕊_x ⊔= 𝔽^rel_t;  atomic_x ← ⊤
-// RmwAcq:     𝔻 = ℂ_t ⊔ 𝕊_x;  ℂ_t ← 𝔻;  Install;  𝕊_x ⊔= 𝔽^rel_t;  atomic_x ← ⊤
-// RmwRel:     Install;  𝔽^acq_t ⊔= 𝕊_x;  𝕊_x ⊔= ℂ_t;  𝕍_x[t] ← ℂ_t;  atomic_x ← ⊤;  tick
-// RmwAcqRel:  𝔻 = ℂ_t ⊔ 𝕊_x;  ℂ_t ← 𝔻;  Install;  𝕊_x ⊔= 𝔻;  𝕍_x[t] ← 𝔻;  atomic_x ← ⊤;  tick
-//
-// RmwRlx and RmwAcq tick only when 𝔽^rel_t ≠ ⊥: then they released what the
-// fence captured, and a write before that release and a write after it must
-// not share an epoch -- the same condition as StoreRlx.
+// Write half before the operation, so a consumer of the value can't miss the
+// clock; read half after.
 uint64_t rule_rmw(void* addr, uint64_t val, uint32_t size, uint32_t op, uint32_t t,
                   bool acquire, bool release, bool shadow, bool mfenced) {
     uintptr_t x = reinterpret_cast<uintptr_t>(addr);
     mfence_effect(t, mfenced);
-    // A read-modify-write always writes, so which halves apply is known before
-    // it runs and the two are taken in separate critical sections around it:
-    // the write half before, so a consumer of the value cannot miss the clock;
-    // the read half after, so the join covers whatever release the value came
-    // from. Both are merges into 𝕊_x, so splitting them changes no result.
-    RmwOutcome o{false};
-    spin_lock(&g_header->global_lock);
-    if (release) {
-        rmw_half_rel_locked(x, t);
-        o.released = true;
-    } else {
-        o.released = rmw_half_rlx_locked(x, t);
-    }
-    spin_unlock(&g_header->global_lock);
-
+    bool released = rmw_half(x, t, release);
     uint64_t old = raw_atomic_rmw(addr, val, size, op);
     push_atomic_write(addr);
-
-    spin_lock(&g_header->global_lock);
-    if (acquire) {
-        load_half_acq_locked(x, t);
-    } else {
-        load_half_rlx_locked(x, t);
-    }
-    spin_unlock(&g_header->global_lock);
-    rmw_finish(x, size, t, o, /*wrote=*/true, shadow);
+    load_half(x, t, acquire);
+    rmw_finish(x, size, t, released, /*wrote=*/true, shadow);
     return old;
 }
 
-// CasOk:    the comparison succeeded  ⟹  the Rmw rule at the success ordering
-// CasFail:  the comparison failed     ⟹  the load rule at the failure ordering:
-//           no Install, no change to 𝕊_x or 𝕍_x, no tick, and WriteVis not required.
+// CasFail: no Install, no change to S_x, no tick.
 uint64_t rule_cas(void* addr, uint64_t expected, uint64_t desired, uint32_t size, uint32_t t,
                   bool ok_acquire, bool ok_release, bool fail_acquire, bool shadow,
                   bool mfenced) {
     uintptr_t x = reinterpret_cast<uintptr_t>(addr);
     mfence_effect(t, mfenced); // `lock cmpxchg` fences whether or not it swaps
-    if (!ok_release && !frel_is_set(t)) {
-        // Nothing this compare-exchange could publish, so the swap runs outside
-        // the lock and its read half joins after it, exactly as a load's does.
+    VectorClock rel = ok_release ? thread_vc(t) : staged_release(t);
+    if (!rel.valid()) {
+        // Nothing to publish: swap, then join like a load.
         uint64_t old = raw_atomic_cas(addr, expected, desired, size);
         bool swapped = old == expected;
         if (swapped) {
             push_atomic_write(addr);
         }
-        spin_lock(&g_header->global_lock);
-        RmwOutcome o = rmw_halves_locked(x, t, swapped ? ok_acquire : fail_acquire,
-                                         /*release=*/false, /*wrote=*/swapped);
-        spin_unlock(&g_header->global_lock);
-        rmw_finish(x, size, t, o, /*wrote=*/swapped, shadow);
+        load_half(x, t, swapped ? ok_acquire : fail_acquire);
+        rmw_finish(x, size, t, /*released=*/false, swapped, shadow);
         return old;
     }
-    // A RELEASING compare-exchange is the one operation that cannot be split:
-    // whether it writes -- and so whether it releases at all -- is known only
-    // once it has run, so its clock cannot be recorded ahead of the value it
-    // publishes, and recording it afterwards would let a consumer read that
-    // value with the release missing from 𝕊_x. The access therefore stays
-    // inside the critical section, and a hook it re-enters sees t_hook_depth
-    // and returns without instrumenting rather than waiting for this lock.
+    // Whether it releases is known only after it runs, so the access stays in
+    // the critical section; a re-entered hook sees t_hook_depth and won't wait.
+    uint64_t k = release_key(x, t);
     HookDepth nested;
-    spin_lock(&g_header->global_lock);
-    uint64_t old = raw_atomic_cas(addr, expected, desired, size);
-    bool swapped = old == expected;
-    if (swapped) {
-        push_atomic_write(addr);
+    uint64_t old;
+    bool swapped;
+    {
+        SyncRef s(k);
+        old = raw_atomic_cas(addr, expected, desired, size);
+        swapped = old == expected;
+        if (swapped) {
+            push_atomic_write(addr);
+        }
+        bool acquire = swapped ? ok_acquire : fail_acquire;
+        (acquire ? thread_vc(t) : facq_vc(t)).merge(s.clock());
+        if (swapped) {
+            s.clock_or_add().merge(rel);
+        }
     }
-    RmwOutcome o = rmw_halves_locked(x, t, swapped ? ok_acquire : fail_acquire, ok_release,
-                                     /*wrote=*/swapped);
-    spin_unlock(&g_header->global_lock);
     nested.release();
-    rmw_finish(x, size, t, o, /*wrote=*/swapped, shadow);
+    rmw_finish(x, size, t, swapped, swapped, shadow);
     return old;
 }
 
-// ---- IR fences --------------------------------------------------------------------
-//
-// An LLVM `fence` affects clocks only. On x86 an acquire, release or
-// acquire-release fence generates no instruction, so it orders nothing in the
-// machine and in particular cannot order a clwb; publication and acquisition
-// are the sfence/mfence intrinsics' job (rule_sfence, rule_mfence).
+// ---- IR fences: clocks only; they order no clwb on x86 ----
 
-// FenceRel:  𝔽^rel_t ← ℂ_t;  ℂ_t[t] ← ℂ_t[t]+1
+// FenceRel: F^rel_t <- C_t; tick.
 void rule_fence_rel(uint32_t t) {
-    spin_lock(&g_header->global_lock);
     frel_vc(t).copy_from(thread_vc(t));
     frel_mark(t);
-    spin_unlock(&g_header->global_lock);
     tick(t);
 }
 
-// FenceAcq:  𝔻 = ℂ_t ⊔ 𝔽^acq_t;  ℂ_t ← 𝔻;  ℂ_t[t] ← 𝔻[t]+1
+// FenceAcq: C_t ⊔= F^acq_t; tick.
 void rule_fence_acq(uint32_t t) {
-    spin_lock(&g_header->global_lock);
     thread_vc(t).merge(facq_vc(t));
-    spin_unlock(&g_header->global_lock);
     tick(t);
 }
 
-// FenceAcqRel:  𝔻 = ℂ_t ⊔ 𝔽^acq_t;  ℂ_t ← 𝔻;  𝔽^rel_t ← 𝔻;  ℂ_t[t] ← 𝔻[t]+1
+// FenceAcqRel: C_t ⊔= F^acq_t; F^rel_t <- C_t; tick.
 void rule_fence_acqrel(uint32_t t) {
-    spin_lock(&g_header->global_lock);
     thread_vc(t).merge(facq_vc(t));
     frel_vc(t).copy_from(thread_vc(t));
     frel_mark(t);
-    spin_unlock(&g_header->global_lock);
     tick(t);
 }
 
-// ---- locks and threads ------------------------------------------------------------
-//
-// These establish happens-before only. They never write back, flush or fence.
+// ---- locks and threads ----
 
-// Lock:  𝔻 = ℂ_t ⊔ 𝕃_a;  ℂ_t ← 𝔻;  ℂ_t[t] ← 𝔻[t]+1
+// Lock: C_t ⊔= L_a; tick.
 void rule_lock(uintptr_t a, uint32_t t) {
-    spin_lock(&g_header->global_lock);
-    ClockEntry* e =
-        find_or_add_clock_entry(g_lock_clocks, &g_header->lock_count, sync_key(a, t));
-    if (e != nullptr) {
-        thread_vc(t).merge(clock_entry_vc(e));
-    }
+    sync_join(lock_key(sync_key(a, t)), thread_vc(t));
     tick(t);
-    spin_unlock(&g_header->global_lock);
 }
 
-// Unlock:  𝕃_a ← ℂ_t;  ℂ_t[t] ← ℂ_t[t]+1
+// Unlock: L_a <- C_t; tick.
 void rule_unlock(uintptr_t a, uint32_t t) {
-    spin_lock(&g_header->global_lock);
-    ClockEntry* e =
-        find_or_add_clock_entry(g_lock_clocks, &g_header->lock_count, sync_key(a, t));
-    if (e != nullptr) {
-        clock_entry_vc(e).copy_from(thread_vc(t));
+    {
+        SyncRef s(lock_key(sync_key(a, t)));
+        s.clock_or_add().copy_from(thread_vc(t));
     }
     tick(t);
-    spin_unlock(&g_header->global_lock);
 }
 
-// Fork:  u fresh  ⟹  ℂ_u ← ℂ_t[u ↦ 1];  ℂ_t[t] ← ℂ_t[t]+1
+// Fork: u fresh ⟹ C_u <- C_t[u ↦ 1]; tick t.
 void rule_fork_locked(uint32_t t, uint32_t u) {
     VectorClock cu = thread_vc(u);
     if (t != UINT32_MAX) {
@@ -418,17 +272,14 @@ void rule_fork_locked(uint32_t t, uint32_t u) {
     }
 }
 
-// Fork, the child-process half: the child's main thread u gets the forking
-// thread's clock as it was at the fork. Taking the parent's LIVE row here would
-// order everything the parent did between fork() and this call before the
-// child, which is a happens-before edge that does not exist.
+// Uses the parent's clock as of the fork; its live row has moved on.
 void rule_fork_process_locked(const VectorClock& parent_at_fork, uint32_t u) {
     VectorClock cu = thread_vc(u);
     cu.merge(parent_at_fork);
     cu.set(u, 1);
 }
 
-// Join:  𝔻 = ℂ_t ⊔ ℂ_u;  ℂ_t ← 𝔻;  ℂ_t[t] ← 𝔻[t]+1
+// Join: C_t ⊔= C_u; tick.
 void rule_join_locked(uint32_t t, uint32_t u) {
     thread_vc(t).merge(thread_vc(u));
     tick(t);
