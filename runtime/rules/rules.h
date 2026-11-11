@@ -82,9 +82,10 @@ void store_update(ByteCell* x, uint32_t t, Epoch now);
 // A store is one event on the bytes X it writes in each cache line c; its
 // premise on the other bytes ranges over c ∖ X.
 
-// Load and Store for every byte of [begin, begin+n).
-void rule_load(uintptr_t begin, size_t n, uint32_t t);
-void rule_store(uintptr_t begin, size_t n, uint32_t t);
+// Load and Store for every byte of [begin, begin+n), in the region whose
+// shadow is `s`.
+void rule_load(Shadow s, uintptr_t begin, size_t n, uint32_t t);
+void rule_store(Shadow s, uintptr_t begin, size_t n, uint32_t t);
 
 // `atomic`: the shadow half of the atomic rules, which the paper leaves out.
 // Their happens-before premises are discharged if the last access was atomic
@@ -92,6 +93,8 @@ void rule_store(uintptr_t begin, size_t n, uint32_t t);
 // leave S_x / V_x to the atomic rules.
 void load_range(uintptr_t begin, size_t n, uint32_t t, bool atomic);
 void store_range(uintptr_t begin, size_t n, uint32_t t, bool atomic);
+void load_range(Shadow s, uintptr_t begin, size_t n, uint32_t t, bool atomic);
+void store_range(Shadow s, uintptr_t begin, size_t n, uint32_t t, bool atomic);
 
 // ---- the fences' effect on the entries ----
 // SFence: ∀x. P_x[t], P'_x[t] ↦ ApplyFin(·, now(t)),  A_x[t] ↦ ApplySFin(A_x[t], now(t))

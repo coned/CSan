@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // VectorClock: a row of the segment; C_t, F^rel_t, F^acq_t, L_a, S_x.
 // Tids are never reused, so entries past live_threads() are zero.
-// One writer per row (the owning thread, or the sync stripe holder), so the
-// loops are plain.
+// One writer per row (the owning thread, or the sync stripe holder); entries
+// are relaxed atomics, since sync_join reads L_a and S_x rows unlocked.
 #ifndef CSAN_VECTORCLOCK_H
 #define CSAN_VECTORCLOCK_H
 
@@ -33,18 +33,23 @@ class VectorClock {
     }
 
     uint32_t get(uint32_t u) const {
-        return row_ != nullptr ? row_[u] : 0;
+        return row_ != nullptr ? ld(u) : 0;
     }
 
     void set(uint32_t u, uint32_t c) {
         if (row_ != nullptr) {
-            row_[u] = c;
+            st(u, c);
         }
     }
 
     // C[self] += 1
     void tick(uint32_t self) {
-        if (row_ != nullptr && row_[self]++ >= kClockLimit) {
+        if (row_ == nullptr) {
+            return;
+        }
+        uint32_t c = ld(self);
+        st(self, c + 1);
+        if (c >= kClockLimit) {
             clock_overflow(self);
         }
     }
@@ -54,10 +59,11 @@ class VectorClock {
         if (row_ == nullptr || other.row_ == nullptr) {
             return;
         }
-        uint32_t* __restrict a = row_;
-        const uint32_t* __restrict b = other.row_;
         for (uint32_t i = 0, n = live_threads(); i < n; ++i) {
-            a[i] = std::max(a[i], b[i]);
+            uint32_t a = ld(i), b = other.ld(i);
+            if (b > a) {
+                st(i, b);
+            }
         }
     }
 
@@ -66,7 +72,9 @@ class VectorClock {
         if (row_ == nullptr || other.row_ == nullptr) {
             return;
         }
-        std::copy_n(other.row_, live_threads(), row_);
+        for (uint32_t i = 0, n = live_threads(); i < n; ++i) {
+            st(i, other.ld(i));
+        }
     }
 
     // E ⊑ C
@@ -75,6 +83,9 @@ class VectorClock {
     }
 
   private:
+    uint32_t ld(uint32_t u) const { return __atomic_load_n(&row_[u], __ATOMIC_RELAXED); }
+    void st(uint32_t u, uint32_t c) { __atomic_store_n(&row_[u], c, __ATOMIC_RELAXED); }
+
     uint32_t* row_ = nullptr;
 };
 

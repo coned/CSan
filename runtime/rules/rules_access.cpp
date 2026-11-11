@@ -209,14 +209,82 @@ static const ByteCell* cell_at(uintptr_t a) {
 
 // ---- Load and Store over a byte range ----
 
+// Whether load_byte(x, ·, t, atomic) would change nothing and report
+// nothing: no premise fails, R_x already holds t's read at `now`, and
+// atomic_x already is `atomic`. Read without the line lock (load_span_noop).
+// An offset is followed only after `seq` vouches for it, so it names a block
+// of its class; such blocks are written only with atomics (arena.cpp).
+static bool load_cell_noop(const ByteCell* x, uint32_t t, uint32_t now, bool atomic,
+                           const LineCell* lc, uint32_t seq) {
+    if (cell_atomic(x) != atomic) {
+        return false;
+    }
+    if (!atomic && !(g_report_once && cell_reported(x))) {
+        Epoch w = x->wb;
+        if (!epoch_le(w, t) || (w != kEpochBot && machine_of(epoch_tid(w)) != machine_of(t))) {
+            return false; // a finding, or the AcqR query: the locked path decides
+        }
+    }
+    Epoch rd = x->rd;
+    if (cell_rd_shared(x)) {
+        return line_read_valid(lc, seq) && readlist_holds(static_cast<uint32_t>(rd), t, now);
+    }
+    return rd == epoch_make(t, now);
+}
+
+// Load on the span is a no-op, by a seqlock read of its line: then the
+// locked Load would have found the same state and left it as it was. Words
+// a read would split, and tracing, take the locked path.
+static bool load_span_noop(const LineSpan& sp, uint32_t t, bool atomic) {
+    if (g_trace_on || tracing()) {
+        return false;
+    }
+    uint32_t seq = line_read_begin(sp.lc);
+    if ((seq & 1) != 0) {
+        return false;
+    }
+    uint32_t now = vc_get(t, t);
+    uint64_t limit = g_header->arena_size;
+    for (uintptr_t a = sp.lo; a < sp.hi;) {
+        uintptr_t word = a & ~(kWordBytes - 1);
+        uintptr_t hi = std::min(sp.hi, word + kWordBytes);
+        const ByteCell* wc = sp.s.cell(word);
+        if (!cell_split(wc)) {
+            if (a != word || hi != word + kWordBytes || !load_cell_noop(wc, t, now, atomic, sp.lc, seq)) {
+                return false;
+            }
+        } else {
+            uint32_t off = cell_rd_off(wc);
+            if (!line_read_valid(sp.lc, seq) || off % 8 != 0 ||
+                off + kWordBytes * sizeof(ByteCell) > limit) {
+                return false;
+            }
+            const ByteCell* bytes = static_cast<const ByteCell*>(arena_at(off));
+            for (uintptr_t b = a; b < hi; ++b) {
+                if (!load_cell_noop(&bytes[b - word], t, now, atomic, sp.lc, seq)) {
+                    return false;
+                }
+            }
+        }
+        a = hi;
+    }
+    return line_read_valid(sp.lc, seq);
+}
+
 // Load for each byte; `atomic` selects the atomic loads' shadow half.
-void load_range(uintptr_t begin, size_t n, uint32_t t, bool atomic) {
-    for_each_line_span(
-        begin, n,
-        [&](const LineSpan& sp) {
-            for_each_cell_read(sp, [&](ByteCell* x, uintptr_t a) { load_byte(x, a, t, atomic); });
-        },
-        [](const LineSpan&) {});
+void load_range(Shadow s, uintptr_t begin, size_t n, uint32_t t, bool atomic) {
+    uintptr_t end = begin + static_cast<uintptr_t>(n);
+    for (uintptr_t a = begin; a < end;) {
+        uintptr_t line = a & ~(kLineBytes - 1);
+        LineSpan sp{s, s.line(line), line, a, std::min(end, line + kLineBytes)};
+        a = sp.hi;
+        if (line_is_hwcc(sp.lc) || load_span_noop(sp, t, atomic)) {
+            continue;
+        }
+        line_lock(sp.lc);
+        for_each_cell_read(sp, [&](ByteCell* x, uintptr_t b) { load_byte(x, b, t, atomic); });
+        line_unlock(sp.lc);
+    }
     count_add(&g_header->counts[t].reads, n);
 }
 
@@ -225,14 +293,14 @@ void load_range(uintptr_t begin, size_t n, uint32_t t, bool atomic) {
 // store also ends release sequences (S_x ↦ 0), on hardware-coherent lines
 // too; `atomic` selects the atomic stores' shadow half, which leave S_x to
 // rules_sync.cpp.
-void store_range(uintptr_t begin, size_t n, uint32_t t, bool atomic) {
+void store_range(Shadow s, uintptr_t begin, size_t n, uint32_t t, bool atomic) {
     auto end_sequences = [&](const LineSpan& sp) {
         for_each_word_in(sp, [&](ByteCell* wc, uintptr_t, uintptr_t lo, uintptr_t hi) {
             end_release_sequences(wc, sp.s.offset(lo), sp.s.offset(hi));
         });
     };
     for_each_line_span(
-        begin, n,
+        s, begin, n,
         [&](const LineSpan& sp) {
             // Under CSAN_REPORT_ONCE the line premise is skipped once the store's
             // first byte was reported; skipping does not feed the memo.
@@ -261,13 +329,21 @@ void store_range(uintptr_t begin, size_t n, uint32_t t, bool atomic) {
 
 // ---- the plain rules ----
 
-void rule_load(uintptr_t begin, size_t n, uint32_t t) {
-    load_range(begin, n, t, /*atomic=*/false);
+void load_range(uintptr_t begin, size_t n, uint32_t t, bool atomic) {
+    load_range(shadow_of(begin), begin, n, t, atomic);
+}
+
+void store_range(uintptr_t begin, size_t n, uint32_t t, bool atomic) {
+    store_range(shadow_of(begin), begin, n, t, atomic);
+}
+
+void rule_load(Shadow s, uintptr_t begin, size_t n, uint32_t t) {
+    load_range(s, begin, n, t, /*atomic=*/false);
 }
 
 // Store, plus S_x ↦ 0: a plain store ends release sequences.
-void rule_store(uintptr_t begin, size_t n, uint32_t t) {
-    store_range(begin, n, t, /*atomic=*/false);
+void rule_store(Shadow s, uintptr_t begin, size_t n, uint32_t t) {
+    store_range(s, begin, n, t, /*atomic=*/false);
 }
 
 } // namespace csan

@@ -46,6 +46,14 @@ endif()
 # PIC so the runtime can also be linked into a shared object (a dlopen()ed
 # plugin); otherwise its TLS is emitted local-exec and that link fails.
 set_target_properties(csan_runtime PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# Checks the runtime's own threads for data races; the tests' code stays
+# uninstrumented (their races are the checked program's) and only links TSan.
+option(CSAN_RUNTIME_TSAN "Build the runtime with ThreadSanitizer" OFF)
+if(CSAN_RUNTIME_TSAN)
+  target_compile_options(csan_runtime PRIVATE -fsanitize=thread -g)
+  target_compile_definitions(csan_runtime PRIVATE CSAN_RUNTIME_TSAN)
+  target_link_options(csan_runtime INTERFACE -fsanitize=thread)
+endif()
 # The runtime issues its own clwb + sfence after every atomic store, so the
 # value reaches CXL memory rather than staying in the storing machine's cache.
 target_compile_options(csan_runtime PRIVATE -Wall -Wextra -O2 -fno-omit-frame-pointer
@@ -125,6 +133,11 @@ foreach(src ${CSAN_PROGRAM_SOURCES})
   set_source_files_properties(${src} PROPERTIES OBJECT_DEPENDS
     ${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_SHARED_MODULE_PREFIX}CSanPass${CMAKE_SHARED_MODULE_SUFFIX})
   add_test(NAME ${name} COMMAND $<TARGET_FILE:${name}>)
+  # TSan sees one process only: machine processes (m2_ and up) are skipped, and
+  # so is the SIGSEGV-inside-a-hook test, which hangs under TSan's signal handling.
+  if(CSAN_RUNTIME_TSAN AND (NOT name MATCHES "^m1_" OR name MATCHES "hook_reentry"))
+    set_tests_properties(${name} PROPERTIES DISABLED TRUE)
+  endif()
   # These use more lock addresses than the default clock-table capacity.
   if(name MATCHES "cas_lock_many")
     set_tests_properties(${name} PROPERTIES

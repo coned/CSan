@@ -68,7 +68,7 @@ bool slotmap_pend(SlotMap* m, uint32_t t, Epoch now, uint32_t pos) {
         }
     }
     if (!slotmap_promote(m)) {
-        atomic_fetch_add_u64(&g_header->overflow_count, 1);
+        count_overflow();
         return false;
     }
     return slotmap_pend(m, t, now, pos);
@@ -200,7 +200,7 @@ bool slotmap_set(SlotMap* m, uint32_t t, SlotState st, uint32_t clk, uint32_t cl
     }
     if (slot == 4) {
         if (!slotmap_promote(m)) {
-            atomic_fetch_add_u64(&g_header->overflow_count, 1);
+            count_overflow();
             return false;
         }
         return slotmap_set(m, t, st, clk, clk_m, pos);
@@ -240,7 +240,7 @@ SlotMap* slotmap_get(uint32_t* poff) {
     if (*poff == 0) {
         uint32_t off = arena_alloc(kClassSlotMap);
         if (off == 0) {
-            atomic_fetch_add_u64(&g_header->overflow_count, 1);
+            count_overflow();
             return nullptr;
         }
         *poff = off;
@@ -279,7 +279,10 @@ SlotMap* cell_acq_get(ByteCell* c) {
 }
 
 SlotMap* cell_pprev_get(ByteCell* c) {
-    return slotmap_get(&c->pprev);
+    uint32_t off = c->pprev;
+    SlotMap* m = slotmap_get(&off);
+    c->pprev = off;
+    return m;
 }
 
 } // namespace csan

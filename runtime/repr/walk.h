@@ -25,9 +25,9 @@ struct LineSpan {
 
 // on_line(span) for each line [begin, begin+n) touches that is checked, with
 // its lock held; on_hwcc(span) for each hardware-coherent one, unlocked.
+// `s`: the region's shadow, resolved by the caller.
 template <class F, class G>
-inline void for_each_line_span(uintptr_t begin, size_t n, F on_line, G on_hwcc) {
-    Shadow s = shadow_of(begin);
+inline void for_each_line_span(Shadow s, uintptr_t begin, size_t n, F on_line, G on_hwcc) {
     uintptr_t end = begin + static_cast<uintptr_t>(n);
     for (uintptr_t a = begin; a < end;) {
         uintptr_t line = a & ~(kLineBytes - 1);
@@ -41,6 +41,11 @@ inline void for_each_line_span(uintptr_t begin, size_t n, F on_line, G on_hwcc) 
         }
         a = sp.hi;
     }
+}
+
+template <class F, class G>
+inline void for_each_line_span(uintptr_t begin, size_t n, F on_line, G on_hwcc) {
+    for_each_line_span(shadow_of(begin), begin, n, on_line, on_hwcc);
 }
 
 // f(wc, word, lo, hi) for each word the span covers, [lo, hi) its covered part.

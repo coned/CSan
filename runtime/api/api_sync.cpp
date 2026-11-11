@@ -16,7 +16,10 @@ namespace {
 
 uint32_t acting_thread() {
     // A hook re-entered from inside another hook records nothing.
-    return g_attached && !inside_hook() ? __csan_thread_id() : UINT32_MAX;
+    if (!g_attached || inside_hook()) {
+        return UINT32_MAX;
+    }
+    return t_tid != UINT32_MAX ? t_tid : __csan_thread_id();
 }
 
 // Only pool memory has shadow; atomics are often used outside it.

@@ -37,12 +37,12 @@ struct Pending {
 std::vector<Pending>& pending_queue(uint32_t t, uint32_t kind);
 
 // UINT32_MAX until assigned.
-extern thread_local uint32_t t_tid;
+extern __thread uint32_t t_tid __attribute__((tls_model("initial-exec"))); // __thread: no TLS init wrapper on the hook path
 
 // Nonzero inside a hook that holds the global lock across the program's own
 // access (a releasing CAS). A SIGSEGV handler run there would deadlock on that
 // lock, so its accesses go unchecked.
-extern thread_local uint32_t t_hook_depth;
+extern __thread uint32_t t_hook_depth __attribute__((tls_model("initial-exec")));
 
 inline bool inside_hook() {
     return t_hook_depth != 0;

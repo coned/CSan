@@ -12,6 +12,32 @@ uint8_t* g_segment = nullptr;
 uint8_t* g_pool = nullptr;
 Region g_regions[kMaxRegions] = {};
 uint32_t g_region_count = 0;
+uint32_t g_region_gen = 1;
+__thread RegionHit t_region_cache[kRegionCacheSlots];
+
+const Region* region_scan(uintptr_t a) {
+    uint32_t gen = __atomic_load_n(&g_region_gen, __ATOMIC_ACQUIRE);
+    uint32_t n = __atomic_load_n(&g_region_count, __ATOMIC_ACQUIRE);
+    uintptr_t page = a >> kRegionPageBits;
+    uintptr_t plo = page << kRegionPageBits;
+    uintptr_t phi = plo + (uintptr_t{1} << kRegionPageBits);
+    const Region* hit = nullptr;
+    bool whole = true; // the page is all in `hit`, or touches no region
+    for (uint32_t i = 0; i < n; ++i) {
+        const Region& r = g_regions[i];
+        if (hit == nullptr && a - r.lo < r.hi - r.lo) {
+            hit = &r;
+        }
+        if (r.lo < phi && plo < r.hi && !(r.lo <= plo && phi <= r.hi && hit == &r)) {
+            whole = false;
+        }
+    }
+    if (whole) {
+        t_region_cache[page % kRegionCacheSlots] =
+            RegionHit{page, gen, hit != nullptr ? static_cast<int32_t>(hit - g_regions) : -1};
+    }
+    return hit;
+}
 Event* g_events = nullptr;
 StackEntry* g_stacks = nullptr;
 uint32_t g_trace_depth = 0;
@@ -29,14 +55,14 @@ SyncEntry* g_sync = nullptr;
 uint32_t g_sync_slots = 0;
 uint8_t* g_arena = nullptr;
 uint32_t g_threads = kDefaultThreads;
-uint32_t g_machine = UINT32_MAX;
-uint32_t g_memo_gen = 0;
-bool g_attached = false;
+Rlx<uint32_t> g_machine{UINT32_MAX};
+Rlx<uint32_t> g_memo_gen{0};
+AcqRel<bool> g_attached{false};
 bool g_initializer = false;
 uint32_t g_pending_hosts = 0;
 uint64_t g_pending_cxl_size = 0;
-thread_local uint32_t t_tid = UINT32_MAX;
-thread_local uint32_t t_hook_depth = 0;
+__thread uint32_t t_tid = UINT32_MAX;
+__thread uint32_t t_hook_depth = 0;
 thread_local std::vector<uint32_t> t_fork_clock;
 thread_local uint32_t t_fork_parent = UINT32_MAX;
 std::once_flag g_init_once;

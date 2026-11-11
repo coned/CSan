@@ -3,6 +3,7 @@
 #include "csan_runtime.h"
 #include "base/atomics.h"
 #include "base/report.h"
+#include "repr/arena.h"
 #include "state/layout.h"
 #include "base/spinlock.h"
 #include "state/state.h"
@@ -42,7 +43,7 @@ uint64_t __csan_race_events(void) {
 }
 
 uint64_t __csan_overflow_count(void) {
-    return g_attached ? atomic_load_u64(&g_header->overflow_count) : 0;
+    return g_attached ? overflow_total() : 0;
 }
 
 uint64_t __csan_race_kind_count(uint32_t kind) {

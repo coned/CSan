@@ -15,13 +15,24 @@
 
 using namespace csan;
 
+// Under CSAN_RUNTIME_TSAN these definitions hide TSan's interceptors, so the
+// next one down is TSan's, not libc's.
+#ifdef CSAN_RUNTIME_TSAN
+extern "C" pid_t __interceptor_fork(void);
+extern "C" int __interceptor_pthread_create(pthread_t*, const pthread_attr_t*, void* (*)(void*),
+                                            void*);
+#define CSAN_NEXT(name) reinterpret_cast<void*>(&__interceptor_##name)
+#else
+#define CSAN_NEXT(name) dlsym(RTLD_NEXT, #name)
+#endif
+
 // ---- fork ----
 // The parent's clock is copied just before the real fork so the child inherits
 // it as of the fork; csan_spawn merges it. The parent then ticks.
 
 extern "C" pid_t fork(void) {
     static pid_t (*real_fork)(void) =
-        reinterpret_cast<pid_t (*)(void)>(dlsym(RTLD_NEXT, "fork"));
+        reinterpret_cast<pid_t (*)(void)>(CSAN_NEXT(fork));
     if (real_fork == nullptr) {
         errno = ENOSYS;
         return -1;
@@ -80,7 +91,7 @@ extern "C" int pthread_create(pthread_t* thread, const pthread_attr_t* attr,
                               void* (*start)(void*), void* arg) {
     static int (*real_create)(pthread_t*, const pthread_attr_t*, void* (*)(void*), void*) =
         reinterpret_cast<int (*)(pthread_t*, const pthread_attr_t*, void* (*)(void*), void*)>(
-            dlsym(RTLD_NEXT, "pthread_create"));
+            CSAN_NEXT(pthread_create));
     if (real_create == nullptr) {
         return EAGAIN;
     }

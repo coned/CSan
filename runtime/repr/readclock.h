@@ -18,6 +18,11 @@ uint32_t readlist_new(Epoch first);
 // which can miss a race but never invent one.
 bool readlist_raise(uint32_t off, uint32_t t, uint32_t c);
 
+// Lock-free, on a seqlock snapshot: whether readlist_raise(off, t, c) would
+// leave the list unchanged. Offsets are bounds-checked, as a torn read may
+// hand over garbage; false when unsure.
+bool readlist_holds(uint32_t off, uint32_t t, uint32_t c);
+
 // R_x ⊑ C_tid
 bool readlist_le(uint32_t off, uint32_t tid);
 

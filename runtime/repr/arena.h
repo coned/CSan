@@ -40,6 +40,13 @@ uint32_t arena_alloc(uint32_t cls);
 // Passing 0 is a no-op.
 void arena_free(uint32_t cls, uint32_t off);
 
+// A shadow record dropped for lack of room: +1 to the overflow count, in the
+// calling thread's slot when it has one.
+void count_overflow();
+
+// The overflow count: the shared counter plus every thread's slot.
+uint64_t overflow_total();
+
 } // namespace csan
 
 #endif

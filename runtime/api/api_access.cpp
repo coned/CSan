@@ -14,7 +14,10 @@ namespace {
 // UINT32_MAX when nothing can be checked. A hook re-entered from inside
 // another hook records nothing rather than wait on a lock it holds.
 uint32_t acting_thread() {
-    return g_attached && !inside_hook() ? __csan_thread_id() : UINT32_MAX;
+    if (!g_attached || inside_hook()) {
+        return UINT32_MAX;
+    }
+    return t_tid != UINT32_MAX ? t_tid : __csan_thread_id();
 }
 
 } // namespace
@@ -23,25 +26,33 @@ extern "C" {
 
 void __csan_read(const void* addr, size_t n) {
     uintptr_t a = reinterpret_cast<uintptr_t>(addr);
-    if (!g_attached || n == 0 || !cxl_contains(a, n)) {
+    if (!g_attached || n == 0) {
+        return;
+    }
+    const Region* r = region_of(a); // cxl_contains(a, n), keeping the region
+    if (r == nullptr || a + n > r->hi) {
         return;
     }
     uint32_t t = acting_thread();
     if (t != UINT32_MAX) {
         trace_record(kEvRead, a, static_cast<uint32_t>(n), t);
-        rule_load(a, n, t);
+        rule_load(Shadow{r->bias}, a, n, t);
     }
 }
 
 void __csan_write(const void* addr, size_t n) {
     uintptr_t a = reinterpret_cast<uintptr_t>(addr);
-    if (!g_attached || n == 0 || !cxl_contains(a, n)) {
+    if (!g_attached || n == 0) {
+        return;
+    }
+    const Region* r = region_of(a); // cxl_contains(a, n), keeping the region
+    if (r == nullptr || a + n > r->hi) {
         return;
     }
     uint32_t t = acting_thread();
     if (t != UINT32_MAX) {
         trace_record(kEvWrite, a, static_cast<uint32_t>(n), t);
-        rule_store(a, n, t);
+        rule_store(Shadow{r->bias}, a, n, t);
     }
 }
 

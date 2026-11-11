@@ -38,8 +38,8 @@ static void mfence_effect(uint32_t t, bool mfenced) {
 // two machines' objects can share an address, so fold in the machine; bit 63
 // separates the two kinds.
 static uint64_t sync_key(uintptr_t a, uint32_t t) {
-    if (cxl_contains(a, 1)) {
-        return shadow_offset(a);
+    if (const Region* r = region_of(a)) { // cxl_contains(a, 1)
+        return a + r->bias;               // shadow_offset(a)
     }
     return (1ull << 63) |
            (static_cast<uint64_t>(a) ^ ((static_cast<uint64_t>(machine_of(t)) + 1) << 48));
@@ -48,7 +48,7 @@ static uint64_t sync_key(uintptr_t a, uint32_t t) {
 // Flags the cell first so a later plain write ends the sequence.
 static uint64_t release_key(uintptr_t x, uint32_t t) {
     uint64_t k = sync_key(x, t);
-    if (cxl_contains(x, 1)) {
+    if ((k >> 63) == 0) { // a pool key: cxl_contains(x, 1)
         mark_release_site(k);
     }
     return k;

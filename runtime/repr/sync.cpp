@@ -80,14 +80,16 @@ void drop(SyncStripe* s, SyncEntry* e) {
 // holding it and the lock was taken over.
 SyncRef::SyncRef(uint64_t key) : key_(key), stripe_(stripe_of(key)) {
     spin_lock(&stripe_->lock);
-    __atomic_store_n(&stripe_->seq, stripe_->seq | 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&stripe_->seq, __atomic_load_n(&stripe_->seq, __ATOMIC_RELAXED) | 1,
+                     __ATOMIC_RELAXED);
     __atomic_thread_fence(__ATOMIC_RELEASE);
     SyncEntry* unused;
     entry_ = probe(stripe_, key, &unused);
 }
 
 SyncRef::~SyncRef() {
-    __atomic_store_n(&stripe_->seq, stripe_->seq + 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&stripe_->seq, __atomic_load_n(&stripe_->seq, __ATOMIC_RELAXED) + 1,
+                     __ATOMIC_RELEASE);
     spin_unlock(&stripe_->lock);
 }
 
@@ -121,7 +123,9 @@ VectorClock SyncRef::clock_or_add() {
     if (slot->state == kSyncDead) {
         --stripe_->dead;
     }
-    *slot = SyncEntry{key_, kSyncLive, off};
+    slot->key = key_;
+    slot->state = kSyncLive;
+    slot->clock = off;
     ++stripe_->live;
     entry_ = slot;
     return clock();
@@ -148,7 +152,12 @@ void sync_join(uint64_t key, VectorClock into) {
         }
         SyncEntry* unused;
         SyncEntry* e = probe(s, key, &unused);
-        uint32_t clock = e != nullptr ? __atomic_load_n(&e->clock, __ATOMIC_RELAXED) : 0;
+        uint32_t clock = e != nullptr ? e->clock.load() : 0;
+        // The row is read only once seq vouches for its offset.
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&s->seq, __ATOMIC_RELAXED) != seq) {
+            continue;
+        }
         uint32_t n = clock != 0 ? live_threads() : 0;
         const uint32_t* row = static_cast<const uint32_t*>(arena_at(clock));
         for (uint32_t i = 0; i < n; ++i) {
@@ -169,7 +178,7 @@ void sync_join(uint64_t key, VectorClock into) {
 uint32_t sync_live() {
     uint32_t n = 0;
     for (uint32_t i = 0; i < kSyncStripes; ++i) {
-        n += __atomic_load_n(&g_sync_stripes[i].live, __ATOMIC_RELAXED);
+        n += g_sync_stripes[i].live;
     }
     return n;
 }

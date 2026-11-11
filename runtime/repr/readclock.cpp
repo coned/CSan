@@ -21,12 +21,12 @@ uint32_t readlist_new(Epoch first) {
 }
 
 bool readlist_raise(uint32_t off, uint32_t t, uint32_t c) {
-    Epoch* free_slot = nullptr;
+    Rlx<Epoch>* free_slot = nullptr;
     ReadList* last = nullptr;
     for (uint32_t o = off; o != 0; o = last->next) {
         last = block_at(o);
         for (uint32_t i = 0; i < kReadListEntries; ++i) {
-            Epoch& e = last->e[i];
+            Rlx<Epoch>& e = last->e[i];
             if (e == kEpochBot) {
                 if (free_slot == nullptr) {
                     free_slot = &e;
@@ -52,6 +52,24 @@ bool readlist_raise(uint32_t off, uint32_t t, uint32_t c) {
     return true;
 }
 
+bool readlist_holds(uint32_t off, uint32_t t, uint32_t c) {
+    uint64_t limit = g_header->arena_size;
+    for (uint32_t o = off, n = 0; o != 0; ++n) {
+        if (n == 64 || o % 8 != 0 || o + sizeof(ReadList) > limit) {
+            return false;
+        }
+        const ReadList* b = block_at(o);
+        for (uint32_t i = 0; i < kReadListEntries; ++i) {
+            Epoch e = b->e[i];
+            if (e != kEpochBot && epoch_tid(e) == t) {
+                return epoch_clock(e) >= c;
+            }
+        }
+        o = b->next;
+    }
+    return false;
+}
+
 bool readlist_le(uint32_t off, uint32_t tid) {
     VectorClock c = thread_vc(tid);
     for (uint32_t o = off; o != 0; o = block_at(o)->next) {
@@ -67,7 +85,7 @@ bool readlist_le(uint32_t off, uint32_t tid) {
 
 uint32_t readlist_copy(uint32_t off) {
     uint32_t head = 0;
-    uint32_t* link = &head;
+    ReadList* prev = nullptr;
     for (uint32_t o = off; o != 0; o = block_at(o)->next) {
         uint32_t copy = arena_alloc(kClassReadList);
         if (copy == 0) {
@@ -76,8 +94,12 @@ uint32_t readlist_copy(uint32_t off) {
         }
         *block_at(copy) = *block_at(o);
         block_at(copy)->next = 0;
-        *link = copy;
-        link = &block_at(copy)->next;
+        if (prev != nullptr) {
+            prev->next = copy;
+        } else {
+            head = copy;
+        }
+        prev = block_at(copy);
     }
     return head;
 }

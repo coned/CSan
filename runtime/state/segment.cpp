@@ -34,7 +34,9 @@ uint32_t allocate_tid_locked() {
         fflush(stderr);
         return UINT32_MAX;
     }
-    return g_header->next_tid++;
+    uint32_t t = g_header->next_tid;
+    atomic_store_u32(&g_header->next_tid, t + 1); // live_threads() reads it unlocked
+    return t;
 }
 
 bool parse_size(const char* s, uint64_t* out) {
@@ -246,10 +248,11 @@ void attach_shared_segment(uint32_t hosts, uint64_t cxl_size) {
     g_arena = g_segment + lay.arena_off;
     g_pool = g_segment + lay.pool_off;
     uintptr_t pool = reinterpret_cast<uintptr_t>(g_pool);
-    g_regions[0] = Region{pool, pool + cxl_size, 0 - static_cast<uint64_t>(pool)};
+    g_regions[0].set(pool, pool + cxl_size, 0 - static_cast<uint64_t>(pool));
     if (g_region_count == 0) {
         __atomic_store_n(&g_region_count, 1u, __ATOMIC_RELEASE);
     }
+    region_changed();
     g_threads = lay.threads;
 
     uint32_t state = atomic_load_u32(&g_header->init_state);
@@ -387,12 +390,12 @@ void csan_ensure_init(uint32_t hosts, uint32_t machine, uint64_t cxl_size) {
                          count_total(&ThreadCounts::reads),
                          count_total(&ThreadCounts::writes),
                          count_total(&ThreadCounts::races),
-                         atomic_load_u64(&g_header->overflow_count),
+                         overflow_total(),
                          sync_live(), g_header->clock_entries,
                          atomic_load_u64(&g_header->clock_table_full),
                          atomic_load_u64(&g_header->arena_bump),
                          atomic_load_u64(&g_header->arena_size),
-                         atomic_load_u64(&g_header->arena_full),
+                         atomic_load_u64(&g_header->arena_full) + count_total(&ThreadCounts::arena_full),
                          atomic_load_u64(&g_header->promote_count),
                          atomic_load_u64(&g_header->split_count),
                          atomic_load_u64(&g_header->rd_shared_count),

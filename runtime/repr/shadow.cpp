@@ -35,7 +35,9 @@ void cell_reset_state(ByteCell* c) {
     uint32_t a = cell_acq_off(c);
     slotmap_release(&a);
     cell_set_acq_off(c, a);
-    slotmap_release(&c->pprev);
+    uint32_t pp = c->pprev;
+    slotmap_release(&pp);
+    c->pprev = pp;
     c->wprev = kEpochBot;
 }
 
@@ -71,7 +73,7 @@ ByteCell* ensure_split(ByteCell* wc) {
         for (uint32_t which = 0; which < 3; ++which) {
             uint32_t src_off = which == 0   ? cell_pub_off(wc)
                                : which == 1 ? cell_acq_off(wc)
-                                            : wc->pprev;
+                                            : wc->pprev.load();
             if (src_off == 0) {
                 continue;
             }
@@ -189,7 +191,7 @@ void mark_release_site(uint64_t key) {
     ByteCell* wc = &g_cells[key / kWordBytes];
     // Lock-free fast path: a flagged word cell is unsplit (split moves the flag
     // to its bytes), and a write that cleared it ended S_x first.
-    if ((__atomic_load_n(&wc->pub, __ATOMIC_RELAXED) & kSyncBit) != 0) {
+    if ((wc->pub & kSyncBit) != 0) {
         return;
     }
     LineCell* lc = &g_lines[key / kLineBytes];

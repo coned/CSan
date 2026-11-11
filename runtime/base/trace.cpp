@@ -37,10 +37,10 @@ struct ModuleRange {
     uint32_t index;
 };
 
-// Process-local cache; the shared table owns names and indices.
+// Per-thread cache (two threads filled one shared slot); the shared table owns names and indices.
 constexpr uint32_t kModuleCacheSize = 8;
-ModuleRange t_module_cache[kModuleCacheSize];
-uint32_t t_module_cached = 0;
+thread_local ModuleRange t_module_cache[kModuleCacheSize];
+thread_local uint32_t t_module_cached = 0;
 
 // Shared index for this path, added if new. Caller holds the global lock.
 uint32_t module_index_locked(const char* path) {
@@ -617,7 +617,7 @@ uint32_t print_slots(std::FILE* out, const char* unit, const char* what, const c
                               ? " -- not counted: another machine"
                               : " -- not counted: not in this thread's clock";
         std::fprintf(out, "  %s %s by thread T%u (tid=%u, machine M%u)%s:\n", verb, unit, u,
-                     g_header->os_tid[u], machine_of(u), why);
+                     g_header->os_tid[u].load(), machine_of(u), why);
         if (by_store) {
             print_pos_block(out, "  by its store at:", rec);
             return false;
@@ -657,7 +657,7 @@ void trace_print_finding(std::FILE* out, uint32_t race_kind, uintptr_t addr, uin
 
     std::fprintf(out, "  %s of size %u at ", verb, len);
     print_location(out, addr);
-    std::fprintf(out, " by thread T%u (tid=%u, machine M%u):\n", tid, g_header->os_tid[tid],
+    std::fprintf(out, " by thread T%u (tid=%u, machine M%u):\n", tid, g_header->os_tid[tid].load(),
                  machine_of(tid));
     trace_print_stack(out, self != nullptr ? self->stack : 0);
     std::fprintf(out, "\n");
@@ -689,7 +689,7 @@ void trace_print_finding(std::FILE* out, uint32_t race_kind, uintptr_t addr, uin
         uint32_t wt = epoch_tid(w);
         char head[192];
         std::snprintf(head, sizeof(head), "LAST WRITE of %s by thread T%u (tid=%u, machine M%u):",
-                      line_kind ? unit : "that byte", wt, g_header->os_tid[wt], machine_of(wt));
+                      line_kind ? unit : "that byte", wt, g_header->os_tid[wt].load(), machine_of(wt));
         print_pos_block(out, head, wpos != nullptr ? *wpos : 0);
     }
     // Last write from this machine: CanAcq consults only P'_x, the publications
@@ -705,7 +705,7 @@ void trace_print_finding(std::FILE* out, uint32_t race_kind, uintptr_t addr, uin
             std::fprintf(out,
                          "  PREVIOUS WRITE of %s from another machine by thread T%u (tid=%u, "
                          "machine M%u).\n\n",
-                         unit, pt, g_header->os_tid[pt], machine_of(pt));
+                         unit, pt, g_header->os_tid[pt].load(), machine_of(pt));
             print_slots(out, unit, "PUBLISHED previous write", "write back", x->pprev, tid,
                         kQueryPubPrev);
         }
@@ -730,7 +730,7 @@ void trace_print_finding(std::FILE* out, uint32_t race_kind, uintptr_t addr, uin
             std::snprintf(head, sizeof(head),
                           "FLUSH by thread T%u (tid=%u, machine M%u) ACQUIRED NOTHING: no "
                           "publication was in its clock:",
-                          u, g_header->os_tid[u], machine_of(u));
+                          u, g_header->os_tid[u].load(), machine_of(u));
             print_block(out, head, e);
             break;
         }

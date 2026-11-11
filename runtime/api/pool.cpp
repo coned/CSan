@@ -294,10 +294,11 @@ void csan_watch(uint32_t id, void* base, size_t size) {
         return;
     }
     uint64_t shadow_off = g_header->watch[slot].shadow_off;
-    g_regions[1 + slot] = Region{b, b + n, shadow_off - static_cast<uint64_t>(b)};
+    g_regions[1 + slot].set(b, b + n, shadow_off - static_cast<uint64_t>(b));
     if (g_region_count < 2 + slot) {
         __atomic_store_n(&g_region_count, 2 + slot, __ATOMIC_RELEASE);
     }
+    region_changed();
 }
 
 } // extern "C"

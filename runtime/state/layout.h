@@ -18,6 +18,7 @@
 #include "csan_runtime.h" // CSAN_RACE_KIND_COUNT: the per-kind counters below
 #include "repr/epoch.h"
 #include "repr/slotstate.h"
+#include "base/atomics.h"
 #include "base/spinlock.h"
 
 #include <cstdint>
@@ -25,7 +26,7 @@
 namespace csan {
 
 constexpr uint32_t kMagic = 0x4353414Eu; // "CSAN"
-constexpr uint32_t kVersion = 17 + (sizeof(Epoch) == 8 ? 0x10000 : 0); // widths never mix
+constexpr uint32_t kVersion = 19 + (sizeof(Epoch) == 8 ? 0x10000 : 0); // widths never mix
 constexpr uint32_t kMaxThreads = 256; // hard cap: TID_BITS below must cover it
 constexpr uint32_t kMaxMachines = 64;
 constexpr uint32_t kMaxRanges = 4096;
@@ -101,13 +102,14 @@ struct SlotProv {
 // pub/acq hold flags.
 // R_x is one Epoch while the reads are ordered by happens-before (the last
 // one stands for all), and a ReadList from the first concurrent read.
+// Every field is Rlx: load_span_noop reads them under a seqlock, not the lock.
 struct ByteCell {
-    Epoch wb;     // W_x; kEpochBot = never written
-    Epoch rd;     // R_x: the last ordered read's Epoch (kEpochBot = none), or ReadList offset
-    uint32_t pub; // flags | P_x SlotMap offset (0 = empty)
-    uint32_t acq; // flags | A_x SlotMap offset (0 = empty)
-    Epoch wprev;  // W'_x: last store to x from a machine other than mach(W_x); kEpochBot = none
-    uint32_t pprev; // P'_x SlotMap offset (0 = empty): the publications of W'_x
+    Rlx<Epoch> wb;     // W_x; kEpochBot = never written
+    Rlx<Epoch> rd;     // R_x: the last ordered read's Epoch (kEpochBot = none), or ReadList offset
+    Rlx<uint32_t> pub; // flags | P_x SlotMap offset (0 = empty)
+    Rlx<uint32_t> acq; // flags | A_x SlotMap offset (0 = empty)
+    Rlx<Epoch> wprev;  // W'_x: last store to x from a machine other than mach(W_x); kEpochBot = none
+    Rlx<uint32_t> pprev; // P'_x SlotMap offset (0 = empty): the publications of W'_x
 };
 
 constexpr uint32_t kRdSharedBit = 1u; // pub bit 0: `rd` is a ReadList offset
@@ -180,20 +182,21 @@ static inline void cell_set_acq_off(ByteCell* c, uint32_t off) {
 // Cost scales with readers, not thread slots.
 constexpr uint32_t kReadListEntries = 7;
 
+// Rlx: readlist_holds reads it under a seqlock.
 struct ReadList {
-    Epoch e[kReadListEntries]; // one per reader; kEpochBot = free
-    uint32_t next;             // next block offset, 0 = end
+    Rlx<Epoch> e[kReadListEntries]; // one per reader; kEpochBot = free
+    Rlx<uint32_t> next;             // next block offset, 0 = end
 };
 
-// ---- LineCell (8 bytes, one per 64-byte line) ----
+// ---- LineCell (12 bytes, one per 64-byte line) ----
 // No line-level history: stores to one line are not ordered among
 // themselves, and every rule reads the bytes' own state. `ver` only lets a
 // thread know the Store premise on the line's other bytes still holds for it.
 struct LineCell {
-    uint8_t lock;      // guards this LineCell and its eight words' ByteCells
+    uint32_t seq;      // the line lock, a seqlock: odd while held; guards this LineCell and its words' ByteCells
     uint8_t flags;     // kHwCcBit
     uint8_t last_mach; // machine of the last store to the line, plus 1; 0 = none
-    uint8_t pad;
+    uint16_t pad;
     uint32_t ver;      // +1 whenever a store comes from a machine other than last_mach
 };
 
@@ -201,15 +204,18 @@ struct LineCell {
 // line lock. kAlign == kLineBytes, so a line never mixes both kinds.
 constexpr uint8_t kHwCcBit = 1u;
 
-// A one-byte lock keeps LineCell small.
 inline void line_lock(LineCell* lc) {
     uint32_t spins = 0;
     for (;;) {
-        if (__atomic_exchange_n(&lc->lock, 1, __ATOMIC_ACQUIRE) == 0) {
+        uint32_t s = __atomic_load_n(&lc->seq, __ATOMIC_RELAXED);
+        if ((s & 1) == 0 &&
+            __atomic_compare_exchange_n(&lc->seq, &s, s + 1, false, __ATOMIC_ACQUIRE,
+                                        __ATOMIC_RELAXED)) {
+            // A reader that sees any store of ours then sees seq odd (or later).
+            __atomic_thread_fence(__ATOMIC_RELEASE);
             return;
         }
-        ++spins;
-        if (spins < 64) {
+        if (++spins < 64) {
             __builtin_ia32_pause();
         } else {
             sched_yield();
@@ -219,7 +225,18 @@ inline void line_lock(LineCell* lc) {
 }
 
 inline void line_unlock(LineCell* lc) {
-    __atomic_store_n(&lc->lock, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&lc->seq, __atomic_load_n(&lc->seq, __ATOMIC_RELAXED) + 1, __ATOMIC_RELEASE);
+}
+
+// Seqlock reads: an even value from line_read_begin, then line_read_valid
+// after reading the line's state, which holds iff no writer ran in between.
+inline uint32_t line_read_begin(const LineCell* lc) {
+    return __atomic_load_n(&lc->seq, __ATOMIC_ACQUIRE);
+}
+
+inline bool line_read_valid(const LineCell* lc, uint32_t s) {
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    return __atomic_load_n(&lc->seq, __ATOMIC_RELAXED) == s;
 }
 
 // ---- WatchRegion: shared memory watched but not allocated by the checker ----
@@ -233,15 +250,16 @@ struct WatchRegion {
 };
 
 // ---- Event (24 bytes, a ring per thread) ----
+// Rlx: a report reads other threads' rings while they write them.
 struct Event {
-    uint64_t addr;  // 0 for a bare fence
-    uint32_t stack; // interned stack id, 0 = none
-    uint32_t seq;   // per-thread counter; detects an EventRef whose ring slot was reused
-    uint32_t from;  // acquire: EventRef of the release merged, 0 = none;
-                    // flush: how many of its lines took a byte acquisition
-    uint8_t kind;   // EventKind
-    uint8_t len;    // bytes, for an access
-    uint16_t src;   // CSAN_SRC_*, for a write-back or flush
+    Rlx<uint64_t> addr;  // 0 for a bare fence
+    Rlx<uint32_t> stack; // interned stack id, 0 = none
+    uint32_t seq;        // per-thread counter; detects an EventRef whose ring slot was reused
+    Rlx<uint32_t> from;  // acquire: EventRef of the release merged, 0 = none;
+                         // flush: how many of its lines took a byte acquisition
+    Rlx<uint8_t> kind;   // EventKind
+    Rlx<uint8_t> len;    // bytes, for an access
+    Rlx<uint16_t> src;   // CSAN_SRC_*, for a write-back or flush
 };
 
 // (tid, seq). Zero = no event; seq starts at 1.
@@ -283,16 +301,17 @@ constexpr uint32_t kSyncStripes = 256;
 
 enum SyncSlot : uint32_t { kSyncEmpty = 0, kSyncLive = 1, kSyncDead = 2 };
 
+// Rlx: sync_join probes a stripe without its lock.
 struct SyncEntry {
-    uint64_t key;
-    uint32_t state; // SyncSlot
-    uint32_t clock; // arena offset of the clock, 0 = none
+    Rlx<uint64_t> key;
+    Rlx<uint32_t> state; // SyncSlot
+    Rlx<uint32_t> clock; // arena offset of the clock, 0 = none
 };
 
 struct alignas(64) SyncStripe {
     SpinLock lock;
     uint32_t seq; // odd while a writer changes the stripe (sync_join)
-    uint32_t live;
+    Rlx<uint32_t> live; // read by sync_live without the lock
     uint32_t dead;
 };
 
@@ -310,6 +329,8 @@ struct alignas(64) ThreadCounts {
     uint64_t writes;
     uint64_t races;                           // reports emitted
     uint64_t race_kind[CSAN_RACE_KIND_COUNT]; // reports by CSAN_RACE_* kind
+    uint64_t arena_full;                      // arena failures after the first (SharedHeader::arena_full)
+    uint64_t overflow;                        // records dropped, beside SharedHeader::overflow_count
 };
 
 // ---- SharedHeader: fixed-size metadata at offset 0 ----
@@ -378,8 +399,8 @@ struct SharedHeader {
     uint32_t trace_stacks;             // slots in the intern table
     uint32_t module_count;             // entries used in modules[]
     ModuleEntry modules[kMaxModules];
-    uint32_t trace_seq[kMaxThreads];   // each thread's next event number
-    uint32_t os_tid[kMaxThreads];      // the kernel tid running each thread, 0 = unknown
+    Rlx<uint32_t> trace_seq[kMaxThreads]; // each thread's next event number
+    Rlx<uint32_t> os_tid[kMaxThreads];    // the kernel tid running each thread, 0 = unknown
 
     // The last 64 reports, as text, for __csan_report().
     uint32_t report_head;
@@ -501,30 +522,57 @@ extern SyncEntry* g_sync;     // stripe i owns g_sync[i * g_sync_slots, (i + 1) 
 extern uint32_t g_sync_slots;
 extern uint8_t* g_arena;      // variable-size shadow state
 extern uint32_t g_threads;    // vector-clock width for this segment
-extern uint32_t g_machine;    // this process's machine id
-extern uint32_t g_memo_gen;   // bumped when this process binds a machine: drops the Store premise memo
-extern bool g_attached;
+extern Rlx<uint32_t> g_machine;  // this process's machine id
+extern Rlx<uint32_t> g_memo_gen; // bumped when this process binds a machine: drops the Store premise memo
+extern AcqRel<bool> g_attached;  // read by every hook, set by whichever thread attaches
 
 // ---- address -> shadow; process-local, so a lookup never reads the segment ----
+// Rlx: csan_watch may rewrite a slot while other threads look addresses up.
 struct Region {
-    uintptr_t lo;
-    uintptr_t hi;  // lo == hi: not mapped here
-    uint64_t bias; // shadow index = address + bias
+    Rlx<uintptr_t> lo;
+    Rlx<uintptr_t> hi;  // lo == hi: not mapped here
+    Rlx<uint64_t> bias; // shadow index = address + bias
+
+    void set(uintptr_t l, uintptr_t h, uint64_t b) {
+        lo = l;
+        hi = h;
+        bias = b;
+    }
 };
 
 constexpr uint32_t kMaxRegions = 1 + kMaxWatchRegions; // [0] the pool, [1 + i] watch[i]
 extern Region g_regions[kMaxRegions];
 extern uint32_t g_region_count;
 
+// Bumped (release) after every change to g_regions; starts at 1.
+extern uint32_t g_region_gen;
+
+// Per thread, the last lookups by 4 KiB page: a page wholly inside one
+// region, or wholly outside all, answers without the scan while g_region_gen
+// is unchanged. idx < 0: no region.
+struct RegionHit {
+    uintptr_t page;
+    uint32_t gen;
+    int32_t idx;
+};
+constexpr uint32_t kRegionCacheSlots = 64;
+constexpr uint32_t kRegionPageBits = 12;
+extern __thread RegionHit t_region_cache[kRegionCacheSlots] __attribute__((tls_model("initial-exec")));
+
+inline void region_changed() {
+    __atomic_fetch_add(&g_region_gen, 1, __ATOMIC_RELEASE);
+}
+
+const Region* region_scan(uintptr_t a);
+
 inline const Region* region_of(uintptr_t a) {
-    uint32_t n = __atomic_load_n(&g_region_count, __ATOMIC_ACQUIRE);
-    for (uint32_t i = 0; i < n; ++i) {
-        const Region& r = g_regions[i];
-        if (a - r.lo < r.hi - r.lo) {
-            return &r;
-        }
+    uint32_t gen = __atomic_load_n(&g_region_gen, __ATOMIC_ACQUIRE);
+    uintptr_t page = a >> kRegionPageBits;
+    const RegionHit& h = t_region_cache[page % kRegionCacheSlots];
+    if (h.page == page && h.gen == gen) {
+        return h.idx < 0 ? nullptr : &g_regions[h.idx];
     }
-    return nullptr;
+    return region_scan(a);
 }
 
 // Is [a, a+n) CXL memory the checker tracks?
